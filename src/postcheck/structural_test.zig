@@ -318,6 +318,14 @@ test "Lambda Solved consumes lifted program through a read-only view" {
     try std.testing.expect(std.mem.find(u8, solve_source, "self.program.lifted.") == null);
 }
 
+test "Lambda Solved unify does not yield explicit empty tag unions" {
+    const solve_source = @embedFile("lambda_solved/solve.zig");
+    const unify_source = sourceSliceBetween(solve_source, "fn unify", "fn transparentAliasBacking");
+    try expectNotContains(unify_source, "isEmptyTagUnion");
+    try expectNotContains(unify_source, "empty tag union");
+    try expectNotContains(solve_source, "fn isEmptyTagUnion");
+}
+
 test "Lambda Mono consumes Lambda Solved through a read-only view" {
     const solved_ast_source = @embedFile("lambda_solved/ast.zig");
     try expectContains(solved_ast_source, "pub const ProgramView = struct");
