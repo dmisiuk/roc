@@ -1280,11 +1280,14 @@ pub const InstGraph = struct {
             } },
             .tag_union => |tags| blk: {
                 const span = types.tagSpan(tags);
-                // An empty tag union in a finished Monotype records a slot no
-                // value reached: either genuinely uninhabited or a variable
-                // defaulted at materialization. Local evidence supersedes it,
-                // so it imports as an unresolved node rather than a closed row.
-                if (span.len == 0) break :blk .{ .unresolved = InstVariable.row(.empty_tag_union) };
+                // Only builder-global Monotypes marked as unsolved may re-enter as row
+                // evidence. An ordinary finished zero-tag union is explicit/proven `[]`.
+                if (span.len == 0) {
+                    if (self.unsolved_monos.contains(ty)) {
+                        break :blk .{ .unresolved = InstVariable.row(.empty_tag_union) };
+                    }
+                    break :blk .empty_tag_union;
+                }
                 const inst_tags = try self.arena().alloc(InstTag, span.len);
                 for (0..span.len) |index| {
                     const tag = GuardedList.at(span, index);
@@ -2605,6 +2608,53 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "explicit empty tag union imports as closed uninhabited row" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const explicit_empty = try type_store.add(.{ .tag_union = Type.Span.empty() });
+    const imported = try graph.importMono(explicit_empty);
+
+    try std.testing.expectEqual(InstNode.empty_tag_union, graph.content(imported));
+}
+
+test "unsolved zero-tag Monotype imports as unresolved row evidence" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const unsolved_empty = try type_store.add(.{ .tag_union = Type.Span.empty() });
+    try unsolved_monos.put(unsolved_empty, {});
+
+    const imported = try graph.importMono(unsolved_empty);
+
+    switch (graph.content(imported)) {
+        .unresolved => |variable| try std.testing.expectEqual(checked.RowDefault.empty_tag_union, variable.row_default.?),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "issue 9647: unresolved tag row extension absorbs rest without allocating a rest node" {
