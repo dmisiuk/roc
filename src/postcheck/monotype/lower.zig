@@ -551,9 +551,10 @@ const Builder = struct {
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     spec_store: specialize.SpecBuilder,
-    /// Monotypes owned by the builder-global type cache. They are lowered without
-    /// body evidence, so this map is explicit provenance for imports that may
-    /// reopen zero-tag unions as unresolved slots inside a later specialization.
+    /// TypeIds whose zero-tag union content has explicit unsolved-row
+    /// provenance. Builder-global cached Monotypes enter here when lowered
+    /// without body evidence; graph-backed views enter when sealed before
+    /// another specialization consumes their final evidence.
     unsolved_monos: std.AutoHashMap(Type.TypeId, void),
     lowered_templates: std.AutoHashMap(Ast.FnId, LoweredTemplate),
     /// Nested-fn specialization records keyed by function id; the durable
@@ -1495,6 +1496,9 @@ const Builder = struct {
         body_ctx.owner_context_fn_key = root_fn_key;
         body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
+        if (requester) |requester_graph| {
+            try self.markGraphBackedUnsolvedRows(requester_graph, lower_fn_ty);
+        }
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
 
@@ -1512,6 +1516,7 @@ const Builder = struct {
         }
         const draft = FinalBodyOutputGuard.begin(self);
         const live_fn_ty = try body_ctx.activeTypeFromNode(root_node);
+        try self.markGraphBackedUnsolvedRows(graph, live_fn_ty);
         const body_fn_ty = if (body_uses_generated_evidence) lower_fn_ty else live_fn_ty;
         const lowered = try body_ctx.lowerTemplateBody(template_ref, template, body_fn_ty);
         const draft_end = draft.end(self);
@@ -2151,6 +2156,7 @@ const Builder = struct {
         graph: *InstGraph,
         fn_ty: Type.TypeId,
     ) Allocator.Error!Type.TypeId {
+        try self.markGraphBackedUnsolvedRows(graph, fn_ty);
         if (!try self.monoTypeHasGeneratedOpaqueEvidence(fn_ty)) return fn_ty;
         try graph.drainDirty();
         var sealer = GraphTypeFinals.init(graph);
@@ -2158,6 +2164,92 @@ const Builder = struct {
         const sealed = try sealer.sealType(fn_ty);
         try graph.assertTypeHasNoGraphViews(sealed);
         return sealed;
+    }
+
+    fn markGraphBackedUnsolvedRows(
+        self: *Builder,
+        graph: *InstGraph,
+        ty: Type.TypeId,
+    ) Allocator.Error!void {
+        var seen = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
+        defer seen.deinit();
+        try self.markGraphBackedUnsolvedRowsInner(graph, ty, &seen);
+    }
+
+    fn markGraphBackedUnsolvedRowsInner(
+        self: *Builder,
+        graph: *InstGraph,
+        ty: Type.TypeId,
+        seen: *std.AutoHashMap(Type.TypeId, void),
+    ) Allocator.Error!void {
+        const seen_entry = try seen.getOrPut(ty);
+        if (seen_entry.found_existing) return;
+
+        const content = self.program.types.get(ty);
+        switch (content) {
+            .tag_union => |tags| {
+                const tag_span = self.program.types.tagSpan(tags);
+                if (tag_span.len == 0) {
+                    if (graph.monoViewNode(ty) != null) {
+                        try self.unsolved_monos.put(ty, {});
+                    }
+                }
+                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
+                    const tag = GuardedList.at(tag_span, tag_index);
+                    const payloads = self.program.types.span(tag.payloads);
+                    for (0..GuardedList.borrowLen(payloads)) |payload_index| {
+                        const payload = GuardedList.at(payloads, payload_index);
+                        try self.markGraphBackedUnsolvedRowsInner(graph, payload, seen);
+                    }
+                }
+            },
+            .record => |fields| {
+                const field_span = self.program.types.fieldSpan(fields);
+                for (0..GuardedList.borrowLen(field_span)) |field_index| {
+                    const field = GuardedList.at(field_span, field_index);
+                    try self.markGraphBackedUnsolvedRowsInner(graph, field.ty, seen);
+                }
+            },
+            .tuple => |items| {
+                const item_span = self.program.types.span(items);
+                for (0..GuardedList.borrowLen(item_span)) |item_index| {
+                    const item = GuardedList.at(item_span, item_index);
+                    try self.markGraphBackedUnsolvedRowsInner(graph, item, seen);
+                }
+            },
+            .list => |elem| try self.markGraphBackedUnsolvedRowsInner(graph, elem, seen),
+            .box => |elem| try self.markGraphBackedUnsolvedRowsInner(graph, elem, seen),
+            .func => |function| {
+                const args = self.program.types.span(function.args);
+                for (0..GuardedList.borrowLen(args)) |arg_index| {
+                    const arg = GuardedList.at(args, arg_index);
+                    try self.markGraphBackedUnsolvedRowsInner(graph, arg, seen);
+                }
+                try self.markGraphBackedUnsolvedRowsInner(graph, function.ret, seen);
+            },
+            .named => |named| {
+                const args = self.program.types.span(named.args);
+                for (0..GuardedList.borrowLen(args)) |arg_index| {
+                    const arg = GuardedList.at(args, arg_index);
+                    try self.markGraphBackedUnsolvedRowsInner(graph, arg, seen);
+                }
+                if (named.backing) |backing| {
+                    try self.markGraphBackedUnsolvedRowsInner(graph, backing.ty, seen);
+                }
+                const declared_fields = self.program.types.declaredFieldSpan(named.declared_order);
+                for (0..GuardedList.borrowLen(declared_fields)) |field_index| {
+                    const field = GuardedList.at(declared_fields, field_index);
+                    switch (field) {
+                        .named => {},
+                        .padding => |padding| try self.markGraphBackedUnsolvedRowsInner(graph, padding, seen),
+                    }
+                }
+            },
+            .primitive,
+            .erased,
+            .zst,
+            => {},
+        }
     }
 
     fn functionShape(self: *Builder, ty: Type.TypeId, comptime message: []const u8) FunctionShape {
@@ -7911,6 +8003,9 @@ const BodyContext = struct {
     }
 
     fn activeNodeFromType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!NodeId {
+        if (self.builder.unsolved_monos.contains(ty)) {
+            if (try self.graph.reopenUnsolvedEmptyTagUnionView(ty)) |node| return node;
+        }
         if (self.graph.monoViewNode(ty)) |node| return node;
         return try self.graph.importMono(ty);
     }
@@ -14447,7 +14542,7 @@ const BodyContext = struct {
         }
         try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            try self.graph.unify(try self.instNode(function.ret), try self.activeNodeFromType(expected));
         }
         try self.graph.drainDirty();
         return fn_node;
@@ -14521,10 +14616,12 @@ const BodyContext = struct {
             Common.invariant("checked dispatch target arity differed from its dispatch plan");
         }
         const fn_node = try self.instNode(source_fn_ty);
-        try self.graph.unify(fn_node, try plan_ctx.instNode(plan_fn_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            const expected_node = try self.activeNodeFromType(expected);
+            try self.graph.unify(try plan_ctx.instNode(plan_function.ret), expected_node);
+            try self.graph.unify(try self.instNode(function.ret), expected_node);
         }
+        try self.graph.unify(fn_node, try plan_ctx.instNode(plan_fn_ty));
         try self.graph.drainDirty();
         return try self.activeTypeFromNode(fn_node);
     }

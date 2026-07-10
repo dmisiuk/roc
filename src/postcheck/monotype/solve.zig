@@ -217,11 +217,10 @@ pub const InstGraph = struct {
     allocator: Allocator,
     types: *Type.Store,
     name_store: *const names.NameStore,
-    /// Provenance for Monotypes lowered without body evidence by the
-    /// builder-global type cache. When one of these final TypeIds is imported
-    /// into a specialization graph, zero-tag unions inside that marked type
-    /// may re-enter as unresolved row evidence. Unmarked zero-tag unions are
-    /// explicit/proven `[]`.
+    /// Provenance for TypeIds whose zero-tag union content is an unsolved row
+    /// slot, not an explicit/proven `[]`. This includes builder-global cached
+    /// Monotypes lowered without body evidence and graph-backed views marked
+    /// before another specialization consumes them.
     unsolved_monos: *const std.AutoHashMap(Type.TypeId, void),
     arena_impl: std.heap.ArenaAllocator,
     nodes: std.ArrayList(InstNode),
@@ -1283,8 +1282,9 @@ pub const InstGraph = struct {
             } },
             .tag_union => |tags| blk: {
                 const span = types.tagSpan(tags);
-                // Only builder-global Monotypes marked as unsolved may re-enter as row
-                // evidence. An ordinary finished zero-tag union is explicit/proven `[]`.
+                // Only TypeIds marked with unsolved-row provenance may re-enter
+                // as row evidence. An ordinary finished zero-tag union is
+                // explicit/proven `[]`.
                 if (span.len == 0) {
                     if (self.unsolved_monos.contains(ty)) {
                         break :blk .{ .unresolved = InstVariable.row(.empty_tag_union) };
@@ -1530,6 +1530,21 @@ pub const InstGraph = struct {
             if (view == ty) return node;
         }
         return null;
+    }
+
+    /// Reopen a graph view whose TypeId was already checked against
+    /// `unsolved_monos`. Sealing can materialize an unresolved row slot as
+    /// closed `[]` before later graph evidence reaches it; this converts only
+    /// those marked views back into unresolved row evidence and queues the
+    /// normal dirty propagation through `setContent`. Ordinary unmarked `[]`
+    /// TypeIds must stay closed and never use this path.
+    pub fn reopenUnsolvedEmptyTagUnionView(self: *InstGraph, ty: Type.TypeId) Allocator.Error!?NodeId {
+        const node = self.monoViewNode(ty) orelse return null;
+        switch (self.nodes.items[@intFromEnum(node)]) {
+            .empty_tag_union => try self.setContent(node, .{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
+            else => {},
+        }
+        return node;
     }
 
     /// Write a node's current content into one of its Monotype views.
