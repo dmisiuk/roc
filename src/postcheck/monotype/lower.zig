@@ -8558,6 +8558,17 @@ const BodyContext = struct {
             }
         }
 
+        for (arg_tys) |arg_ty| {
+            if (self.typeIsClosedEmptyTagUnion(arg_ty)) {
+                const body = try self.runtimeCrashExpr(ret_ty, "called function with an uninhabited argument");
+                return .{
+                    .args = try self.addTypedLocalSpan(args),
+                    .body = body,
+                    .ret = try self.draftTypeCell(ret_ty),
+                };
+            }
+        }
+
         var body = try self.lowerBindingContinuation(.{ .materialized_args = .{
             .args = materialized_args.items,
             .index = 0,
