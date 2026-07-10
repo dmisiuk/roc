@@ -551,9 +551,9 @@ const Builder = struct {
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     spec_store: specialize.SpecBuilder,
-    /// Monotypes owned by the builder-global type cache. They are lowered
-    /// without body evidence, so empty tag unions inside them are unresolved
-    /// slots rather than solved uninhabited types.
+    /// Monotypes owned by the builder-global type cache. They are lowered without
+    /// body evidence, so this map is explicit provenance for imports that may
+    /// reopen zero-tag unions as unresolved slots inside a later specialization.
     unsolved_monos: std.AutoHashMap(Type.TypeId, void),
     lowered_templates: std.AutoHashMap(Ast.FnId, LoweredTemplate),
     /// Nested-fn specialization records keyed by function id; the durable
@@ -7989,10 +7989,9 @@ const BodyContext = struct {
     /// checked identity so every occurrence of the same checked root resolves
     /// to the same node within this instantiation context.
     fn instNode(self: *BodyContext, checked_ty: checked.CheckedTypeId) Allocator.Error!NodeId {
-        // A checked empty tag union carries no identity worth sharing: it
-        // records that nothing reaches a slot, and the slot yields to sibling
-        // descriptions. One checked id serves many unrelated slots, so each
-        // occurrence instantiates independently.
+        // A checked empty tag union has no source/backing identity worth
+        // sharing across instantiation sites. One checked id serves many
+        // unrelated row slots, so each occurrence instantiates independently.
         switch (checkedPayload(self.view, checked_ty)) {
             .empty_tag_union => return try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
             else => {},
@@ -8040,11 +8039,10 @@ const BodyContext = struct {
                 variable.row_default,
             ) }),
             .empty_record => try self.graph.newNode(.empty_record),
-            // A checked empty tag union records that no value reaches the
-            // slot. Sibling descriptions of the same slot may still carry
-            // tags (which are then unreachable), so the slot yields to them
-            // and defaults to the empty union only when nothing else claims
-            // it.
+            // A checked empty tag union has no source/backing identity to
+            // preserve here. It enters the graph as explicit row evidence for
+            // this occurrence, and later sealing decides the final row from
+            // the complete instantiation evidence.
             .empty_tag_union => try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
             .alias => |alias| try self.graph.newNode(.{ .named = .{
                 .named_type = .{ .module = self.builder.declaredModuleForAlias(self.view, alias), .ty = checked_ty },

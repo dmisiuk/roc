@@ -217,8 +217,11 @@ pub const InstGraph = struct {
     allocator: Allocator,
     types: *Type.Store,
     name_store: *const names.NameStore,
-    /// Monotypes lowered without body evidence (the builder-global type
-    /// cache); empty tag unions inside them are unresolved slots.
+    /// Provenance for Monotypes lowered without body evidence by the
+    /// builder-global type cache. When one of these final TypeIds is imported
+    /// into a specialization graph, zero-tag unions inside that marked type
+    /// may re-enter as unresolved row evidence. Unmarked zero-tag unions are
+    /// explicit/proven `[]`.
     unsolved_monos: *const std.AutoHashMap(Type.TypeId, void),
     arena_impl: std.heap.ArenaAllocator,
     nodes: std.ArrayList(InstNode),
