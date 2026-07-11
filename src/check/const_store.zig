@@ -144,12 +144,39 @@ pub const ConstCapture = struct {
     value: ConstNodeId,
 };
 
+/// Dispatch evidence selected for a stored compile-time function value. Target
+/// module identities make every checked id explicitly relative to its owning
+/// checked module when the function is restored in another compilation.
+pub const ConstFnNestedEvidence = struct {
+    count: u32,
+    subtree_len: u32,
+};
+
+pub const ConstFnCallableInstantiation = struct {
+    view: names.CheckedModuleDigest,
+    callable_ty: checked_ids.CheckedTypeId,
+};
+
+pub const ConstFnEvidence = union(enum) {
+    target: struct {
+        view: names.CheckedModuleDigest,
+        method: static_dispatch.MethodTarget,
+        instantiation: ?ConstFnCallableInstantiation,
+        nested: ConstFnNestedEvidence,
+    },
+    structural: static_dispatch.StructuralKind,
+    unreachable_value,
+    checked_error,
+};
+
 /// Function value stored by compile-time evaluation.
 pub const ConstFn = struct {
     fn_def: FnDef,
     source_fn_ty: checked_ids.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     captures: []const ConstCapture = &.{},
+    evidence: []const ConstFnEvidence = &.{},
+    evidence_frame_root_counts: []const u32 = &.{},
 };
 
 /// Named type owner for a stored nominal constant.
@@ -240,6 +267,8 @@ const StoredFn = struct {
     source_fn_ty: checked_ids.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     captures: ConstRange = .{},
+    evidence: ConstRange = .{},
+    evidence_frame_root_counts: ConstRange = .{},
 };
 
 /// Store of monomorphic type evidence attached to compile-time constants.
@@ -507,6 +536,9 @@ pub const ConstStore = struct {
     type_store: ConstTypeStore,
     /// Flat pool of function captures.
     capture_pool: std.ArrayList(ConstCapture),
+    /// Flat evidence vectors referenced by stored functions.
+    evidence_pool: std.ArrayList(ConstFnEvidence),
+    evidence_frame_root_count_pool: std.ArrayList(u32),
     /// Flat pool of all string backing bytes; `str_views` indexes into it.
     str_backing: std.ArrayList(u8),
     /// `ConstStrDataId` -> range into `str_backing`.
@@ -524,6 +556,8 @@ pub const ConstStore = struct {
             .tag_name_pool = .empty,
             .type_store = ConstTypeStore.init(allocator),
             .capture_pool = .empty,
+            .evidence_pool = .empty,
+            .evidence_frame_root_count_pool = .empty,
             .str_backing = .empty,
             .str_views = .empty,
         };
@@ -584,11 +618,15 @@ pub const ConstStore = struct {
     pub fn appendFn(self: *ConstStore, fn_value: ConstFn) Allocator.Error!ConstFnId {
         const id: ConstFnId = @enumFromInt(@as(u32, @intCast(self.fns.items.len)));
         const captures_range = try artifact_serialize.appendSpan(ConstRange, ConstCapture, &self.capture_pool, self.allocator, fn_value.captures);
+        const evidence_range = try artifact_serialize.appendSpan(ConstRange, ConstFnEvidence, &self.evidence_pool, self.allocator, fn_value.evidence);
+        const evidence_frame_root_counts = try artifact_serialize.appendSpan(ConstRange, u32, &self.evidence_frame_root_count_pool, self.allocator, fn_value.evidence_frame_root_counts);
         try self.fns.append(self.allocator, .{
             .fn_def = fn_value.fn_def,
             .source_fn_ty = fn_value.source_fn_ty,
             .source_fn_key = fn_value.source_fn_key,
             .captures = captures_range,
+            .evidence = evidence_range,
+            .evidence_frame_root_counts = evidence_frame_root_counts,
         });
         return id;
     }
@@ -631,6 +669,8 @@ pub const ConstStore = struct {
             .source_fn_ty = stored.source_fn_ty,
             .source_fn_key = stored.source_fn_key,
             .captures = self.capture_pool.items[stored.captures.start .. stored.captures.start + stored.captures.len],
+            .evidence = self.evidence_pool.items[stored.evidence.start .. stored.evidence.start + stored.evidence.len],
+            .evidence_frame_root_counts = self.evidence_frame_root_count_pool.items[stored.evidence_frame_root_counts.start .. stored.evidence_frame_root_counts.start + stored.evidence_frame_root_counts.len],
         };
     }
 
@@ -652,12 +692,14 @@ pub const ConstStore = struct {
         tag_name_pool: artifact_serialize.SerializedSlice(u8) = .{},
         type_store: ConstTypeStore.Serialized = .{},
         capture_pool: artifact_serialize.SerializedSlice(ConstCapture) = .{},
+        evidence_pool: artifact_serialize.SerializedSlice(ConstFnEvidence) = .{},
+        evidence_frame_root_count_pool: artifact_serialize.SerializedSlice(u32) = .{},
         str_backing: artifact_serialize.SerializedSlice(u8) = .{},
         str_views: artifact_serialize.SerializedSlice(ConstRange) = .{},
 
         comptime {
-            // 7 value/function side lists + 5 nested type-store lists.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 12);
+            // 9 value/function side lists + 5 nested type-store lists.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 14);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(ConstStore, @This());
@@ -708,6 +750,8 @@ pub const ConstStore = struct {
             self.node_pool.deinit(self.allocator);
             self.tag_name_pool.deinit(self.allocator);
             self.capture_pool.deinit(self.allocator);
+            self.evidence_pool.deinit(self.allocator);
+            self.evidence_frame_root_count_pool.deinit(self.allocator);
             self.str_backing.deinit(self.allocator);
             self.str_views.deinit(self.allocator);
         }
@@ -814,6 +858,26 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
     const capture_ty = try store.type_store.append(.{ .primitive = .u64 });
     const caps = try gpa.dupe(ConstCapture, &.{.{ .id = CaptureId.fromBinder(@enumFromInt(1)), .ty = capture_ty, .value = a }});
     defer gpa.free(caps);
+    var target_view: names.CheckedModuleDigest = .{};
+    target_view.bytes[0] = 0xA1;
+    var instantiation_view: names.CheckedModuleDigest = .{};
+    instantiation_view.bytes[0] = 0xB2;
+    const evidence = [_]ConstFnEvidence{
+        .{ .target = .{
+            .view = target_view,
+            .method = .{
+                .module_idx = 4,
+                .def_idx = @enumFromInt(5),
+                .kind = .generated_structural_parser,
+                .callable_ty = @enumFromInt(6),
+            },
+            .instantiation = .{ .view = instantiation_view, .callable_ty = @enumFromInt(7) },
+            .nested = .{ .count = 1, .subtree_len = 1 },
+        } },
+        .{ .structural = .equality },
+        .checked_error,
+    };
+    const evidence_frame_root_counts = [_]u32{ 1, 1 };
     const fn_id = try store.appendFn(.{
         // Distinct non-zero ids: this test asserts captures round-trip; the fn_def
         // fields just need to survive, not be specific values.
@@ -821,6 +885,8 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
         .source_fn_ty = @enumFromInt(3),
         .source_fn_key = .{},
         .captures = caps,
+        .evidence = &evidence,
+        .evidence_frame_root_counts = &evidence_frame_root_counts,
     });
 
     // Serialize → aligned buffer → deserialize.
@@ -856,6 +922,21 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
     try std.testing.expectEqual(capture_ty, loaded_fn.captures[0].ty);
     try std.testing.expectEqual(ConstType{ .primitive = .u64 }, loaded.type_store.get(loaded_fn.captures[0].ty));
     try std.testing.expectEqual(a, loaded_fn.captures[0].value);
+    try std.testing.expectEqual(evidence.len, loaded_fn.evidence.len);
+    const loaded_target = loaded_fn.evidence[0].target;
+    try std.testing.expectEqualSlices(u8, &target_view.bytes, &loaded_target.view.bytes);
+    try std.testing.expectEqual(@as(u32, 4), loaded_target.method.module_idx);
+    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(loaded_target.method.def_idx));
+    try std.testing.expectEqual(static_dispatch.MethodTargetKind.generated_structural_parser, loaded_target.method.kind);
+    try std.testing.expectEqual(@as(checked_ids.CheckedTypeId, @enumFromInt(6)), loaded_target.method.callable_ty);
+    const loaded_instantiation = loaded_target.instantiation.?;
+    try std.testing.expectEqualSlices(u8, &instantiation_view.bytes, &loaded_instantiation.view.bytes);
+    try std.testing.expectEqual(@as(checked_ids.CheckedTypeId, @enumFromInt(7)), loaded_instantiation.callable_ty);
+    try std.testing.expectEqual(@as(u32, 1), loaded_target.nested.count);
+    try std.testing.expectEqual(@as(u32, 1), loaded_target.nested.subtree_len);
+    try std.testing.expectEqual(ConstFnEvidence{ .structural = .equality }, loaded_fn.evidence[1]);
+    try std.testing.expectEqual(ConstFnEvidence.checked_error, loaded_fn.evidence[2]);
+    try std.testing.expectEqualSlices(u32, &evidence_frame_root_counts, loaded_fn.evidence_frame_root_counts);
 }
 
 test "ConstStore.appendFn: no leak or double-free under allocation failure" {

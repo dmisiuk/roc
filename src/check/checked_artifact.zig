@@ -3897,6 +3897,18 @@ pub const CheckedTypeStore = struct {
 
         try appendStaticDispatchTypeRoots(allocator, module, names, import_views, source_nodes, &store, &active);
 
+        // Constraint evidence carries the exact discharged target
+        // instantiation. Include those fresh roots so every evidence node can
+        // directly reference its target type.
+        for (module_env.scheme_instantiations.items.items) |record| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.dispatch_target)) continue;
+            _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, @enumFromInt(record.slot_data));
+            const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+            for (pairs) |pair| {
+                _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, @enumFromInt(pair.fresh_var));
+            }
+        }
+
         for (module_env.store.sliceDefs(module_env.global_value_defs)) |def_idx| {
             const root = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, module.defType(def_idx));
             const scheme_key = try canonical_type_keys.schemeFromVar(
@@ -6464,6 +6476,37 @@ fn appendCheckedTypeRootWithRowDefault(
 ) Allocator.Error!CheckedTypeId {
     const resolved = module.typeStoreConst().resolveVar(var_);
     const resolved_var = resolved.var_;
+
+    // The checker explicitly marks an otherwise-unresolved identity when it
+    // closes that identity to `[]`. Preserve the surviving root as a checked
+    // variable and carry `[]` only as its row default.
+    if (resolved.desc.empty_tag_union_is_default) {
+        if (active.get(resolved_var)) |id| {
+            applyCheckedTypeRowDefault(store, id, row_default);
+            return id;
+        }
+
+        const key_info = try canonical_type_keys.fromVarInfo(
+            allocator,
+            module.typeStoreConst(),
+            module.moduleEnvConst(),
+            resolved_var,
+        );
+        const id: CheckedTypeId = @enumFromInt(@as(u32, @intCast(store.roots.items.len)));
+        try store.roots.append(allocator, .{ .id = id, .key = key_info.key });
+        errdefer _ = store.roots.pop();
+        try store.payloads.append(allocator, .pending);
+        errdefer _ = store.payloads.pop();
+        try active.put(resolved_var, id);
+        errdefer _ = active.remove(resolved_var);
+
+        const stored = try store.commitPayload(allocator, .{ .flex = .{
+            .row_default = .empty_tag_union,
+        } });
+        store.payloads.items[@intFromEnum(id)] = stored;
+        return id;
+    }
+
     if (active.get(resolved_var)) |id| {
         applyCheckedTypeRowDefault(store, id, row_default);
         return id;
@@ -7056,6 +7099,128 @@ test "checked type publication normalizes closed empty tag union backing" {
 
 test "checked type publication normalizes closed empty record backing" {
     try expectSingleNominalBackingPayload(std.testing.allocator, "Foo", "Foo := {}", .empty_record);
+}
+
+fn withEmptyTagCheckedOutputForTest(
+    allocator: Allocator,
+    comptime inspect: fn (TypedCIR.Module, *canonical.CanonicalNameStore, CheckedImportViews, *CheckedTypeStore, *std.AutoHashMap(Var, CheckedTypeId), *types.Store, Var) anyerror!void,
+) !void {
+    const TestEnv = @import("test/TestEnv.zig");
+
+    var test_env = try TestEnv.init("Main", "value = {}");
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    const source_modules = [_]TypedCIR.Modules.SourceModule{
+        .{ .precompiled = test_env.module_env },
+    };
+    var modules = try TypedCIR.Modules.init(allocator, &source_modules);
+    defer modules.deinit();
+
+    const module = modules.module(0);
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+    var active = std.AutoHashMap(Var, CheckedTypeId).init(allocator);
+    defer active.deinit();
+
+    const mutable_types = &test_env.module_env.types;
+    const explicit_empty = try mutable_types.freshFromContent(.{ .structure = .empty_tag_union });
+    try inspect(module, &names, .{
+        .current_owner = testCheckedModuleKey(1),
+        .direct = &.{},
+        .available = &.{},
+    }, &store, &active, mutable_types, explicit_empty);
+}
+
+test "checked output preserves shared defaulted empty-tag identity" {
+    const allocator = std.testing.allocator;
+    try withEmptyTagCheckedOutputForTest(allocator, struct {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
+            _ = explicit_empty;
+            const identity = try type_store.fresh();
+            try type_store.setVarToEmptyTagUnionDefault(identity);
+            const alias = try type_store.freshRedirect(identity);
+            const first = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, identity);
+            const second = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, alias);
+            try std.testing.expectEqual(first, second);
+            const variable = switch (store.payload(first)) {
+                .flex => |flex| flex,
+                else => return error.ExpectedFlexIdentity,
+            };
+            try std.testing.expectEqual(RowDefault.empty_tag_union, variable.row_default.?);
+        }
+    }.inspect);
+}
+
+test "checked output preserves distinct defaulted empty-tag identities" {
+    const allocator = std.testing.allocator;
+    try withEmptyTagCheckedOutputForTest(allocator, struct {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
+            _ = explicit_empty;
+            const first_identity = try type_store.fresh();
+            const second_identity = try type_store.fresh();
+            try type_store.setVarToEmptyTagUnionDefault(first_identity);
+            try type_store.setVarToEmptyTagUnionDefault(second_identity);
+            const first = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, first_identity);
+            const second = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, second_identity);
+            try std.testing.expect(first != second);
+            for ([_]CheckedTypeId{ first, second }) |root| {
+                const variable = switch (store.payload(root)) {
+                    .flex => |flex| flex,
+                    else => return error.ExpectedFlexIdentity,
+                };
+                try std.testing.expectEqual(RowDefault.empty_tag_union, variable.row_default.?);
+            }
+        }
+    }.inspect);
+}
+
+test "checked output keeps proven closed empty tag union explicit" {
+    const allocator = std.testing.allocator;
+    try withEmptyTagCheckedOutputForTest(allocator, struct {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), _: *types.Store, explicit_empty: Var) !void {
+            const root = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, explicit_empty);
+            try std.testing.expectEqual(CheckedTypePayload.empty_tag_union, store.payload(root));
+        }
+    }.inspect);
+}
+
+test "checked output keeps redirected proven empty tag union explicit" {
+    const allocator = std.testing.allocator;
+    try withEmptyTagCheckedOutputForTest(allocator, struct {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
+            const redirected = try type_store.freshRedirect(explicit_empty);
+            const root = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, redirected);
+            try std.testing.expectEqual(CheckedTypePayload.empty_tag_union, store.payload(root));
+        }
+    }.inspect);
+}
+
+test "checked output retains defaulted identity inside parent function digest" {
+    const allocator = std.testing.allocator;
+    try withEmptyTagCheckedOutputForTest(allocator, struct {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
+            _ = explicit_empty;
+            const identity = try type_store.fresh();
+            try type_store.setVarToEmptyTagUnionDefault(identity);
+            const function_content = try type_store.mkFuncPure(&.{identity}, identity);
+            const function_var = try type_store.freshFromContent(function_content);
+            const root = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, function_var);
+            const function = switch (store.payload(root)) {
+                .function => |payload| payload,
+                else => return error.ExpectedFunctionPayload,
+            };
+            try std.testing.expectEqual(@as(usize, 1), function.args.len);
+            try std.testing.expectEqual(function.args[0], function.ret);
+            const variable = switch (store.payload(function.ret)) {
+                .flex => |flex| flex,
+                else => return error.ExpectedFlexIdentity,
+            };
+            try std.testing.expectEqual(RowDefault.empty_tag_union, variable.row_default.?);
+        }
+    }.inspect);
 }
 
 test "checked artifact builtin nominal categorization requires explicit builtin origin" {
@@ -13508,12 +13673,10 @@ const EvidencePass = struct {
             // constraints on a shared dispatcher var unify their fn vars, so
             // a mismatched root here means the site's callable was pinned to
             // one instantiation's concrete type.
-            if (builtin.mode == .Debug) {
-                if (constraint_fn_var) |fn_var| {
-                    const chain_fn_var = chain[ref.depth][ref.index].constraint.fn_var;
-                    if (self.types.resolveVar(fn_var).var_ != self.types.resolveVar(chain_fn_var).var_) {
-                        checkedArtifactInvariant("constraint-resolved dispatch callable was not the scheme-pristine constraint fn type", .{});
-                    }
+            if (constraint_fn_var) |fn_var| {
+                const chain_fn_var = chain[ref.depth][ref.index].constraint.fn_var;
+                if (self.types.resolveVar(fn_var).var_ != self.types.resolveVar(chain_fn_var).var_) {
+                    checkedArtifactInvariant("constraint-resolved dispatch callable was not the scheme-pristine constraint fn type", .{});
                 }
             }
             return .{ .constraint = ref };
@@ -13539,7 +13702,7 @@ const EvidencePass = struct {
                 .checking_finalized => return .checked_error,
             };
             if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
-                const node = try self.evidenceNodeForTarget(target, null);
+                const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
                 return .{ .direct = node };
             }
         }
@@ -13608,17 +13771,29 @@ const EvidencePass = struct {
             }
             defer _ = self.record_in_progress.remove(idx);
 
+            const instantiated_callable_ty = self.checked_types.rootForSourceVar(self.module, constraint_fn_var.?) orelse
+                checkedArtifactInvariant("dispatch target instantiated callable was missing from checked type output", .{});
             const nested = try self.evidenceRefsForRecord(idx);
             const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
-            try self.evidence_nodes.append(self.allocator, .{ .target = target, .nested = nested });
+            try self.evidence_nodes.append(self.allocator, .{
+                .target = target,
+                .instantiation = .{ .callable = instantiated_callable_ty },
+                .nested = nested,
+            });
             try self.node_by_record.put(idx, node_id);
             return node_id;
         }
 
-        // Monomorphic target (or a discharge this pass has no record for —
-        // e.g. a recursion-cycle placeholder): no nested obligations.
+        // A discharge without a scheme-instantiation record still carries its
+        // exact checked callable relation; it simply has no nested obligations.
+        // Only target selections that have no constraint function variable at
+        // all are intrinsically monomorphic.
+        const instantiation: static_dispatch.EvidenceTargetInstantiation = if (constraint_fn_var) |fn_var| .{
+            .callable = self.checked_types.rootForSourceVar(self.module, fn_var) orelse
+                checkedArtifactInvariant("dispatch target callable was missing from checked type output", .{}),
+        } else .monomorphic;
         const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
-        try self.evidence_nodes.append(self.allocator, .{ .target = target });
+        try self.evidence_nodes.append(self.allocator, .{ .target = target, .instantiation = instantiation });
         return node_id;
     }
 
@@ -25941,7 +26116,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 191);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 193);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -26085,7 +26260,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 16;
+    const serialized_layout_version: u32 = 17;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -30640,8 +30815,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x9B, 0x46, 0x4A, 0x21, 0x89, 0x52, 0xF5, 0xCB, 0x5B, 0xC0, 0xE7, 0xF8, 0x71, 0x0A, 0xCA, 0x52,
-        0x93, 0xBA, 0xD1, 0x02, 0xEB, 0xEC, 0xA0, 0x63, 0x67, 0xE0, 0xAB, 0x25, 0x0B, 0x7D, 0xA7, 0x89,
+        0x04, 0xC7, 0x1A, 0x6A, 0xE3, 0x24, 0xA8, 0xC9, 0x68, 0x32, 0xDC, 0x35, 0x4A, 0xA0, 0x78, 0x61,
+        0x8F, 0x45, 0x39, 0xC6, 0x6A, 0x60, 0xA0, 0xBD, 0x33, 0xE4, 0x85, 0x96, 0xA0, 0x2C, 0xA3, 0x28,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

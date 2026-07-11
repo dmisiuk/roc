@@ -399,6 +399,8 @@ pub const Writer = struct {
             .source_fn_ty = variant.template.source_fn_ty,
             .source_fn_key = variant.template.source_fn_key,
             .captures = captures,
+            .evidence = variant.template.evidence,
+            .evidence_frame_root_counts = variant.template.evidence_frame_root_counts,
         });
     }
 
@@ -419,6 +421,8 @@ pub const Writer = struct {
                 .source_fn_ty = entry.template.source_fn_ty,
                 .source_fn_key = entry.template.source_fn_key,
                 .captures = captures,
+                .evidence = entry.template.evidence,
+                .evidence_frame_root_counts = entry.template.evidence_frame_root_counts,
             });
         }
         writerInvariant("erased callable result did not match an explicit erased function entry");

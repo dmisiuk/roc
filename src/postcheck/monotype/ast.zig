@@ -120,6 +120,10 @@ pub const FnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: Type.TypeId,
+    /// Explicit dispatch selections captured when this specialization was
+    /// created, retained for compile-time function values.
+    const_evidence: Span(check.ConstStore.ConstFnEvidence) = Span(check.ConstStore.ConstFnEvidence).empty(),
+    const_evidence_frame_root_counts: Span(u32) = Span(u32).empty(),
 };
 
 /// Monotype function-specialization metadata.
@@ -832,6 +836,8 @@ pub const ProgramView = struct {
     specs: []const SpecRecord,
     imported_fns: []const ImportedFn,
     fns: []const Fn,
+    const_fn_evidence: []const check.ConstStore.ConstFnEvidence,
+    const_fn_evidence_frame_root_counts: []const u32,
     defs: []const Def,
     nested_defs: []const NestedDef,
     exprs: []const Expr,
@@ -867,6 +873,14 @@ pub const ProgramView = struct {
         const raw = @intFromEnum(id);
         if (raw >= self.fns.len) Common.invariant("Monotype function id referenced a missing specialization");
         return self.fns[raw].source;
+    }
+
+    pub fn constFnEvidence(self: ProgramView, span: Span(check.ConstStore.ConstFnEvidence)) []const check.ConstStore.ConstFnEvidence {
+        return self.const_fn_evidence[span.start..][0..span.len];
+    }
+
+    pub fn constFnEvidenceFrameRootCounts(self: ProgramView, span: Span(u32)) []const u32 {
+        return self.const_fn_evidence_frame_root_counts[span.start..][0..span.len];
     }
 
     pub fn procDebugName(self: ProgramView, symbol: Common.Symbol) ?names.ExportNameId {
@@ -992,6 +1006,8 @@ pub const ProgramBuilder = struct {
     specs: ProgramList(SpecRecord, "specs"),
     imported_fns: ProgramList(ImportedFn, "imported_fns"),
     fns: ProgramList(Fn, "fns"),
+    const_fn_evidence: ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence"),
+    const_fn_evidence_frame_root_counts: ProgramList(u32, "const_fn_evidence_frame_root_counts"),
     defs: ProgramList(Def, "defs"),
     nested_defs: ProgramList(NestedDef, "nested_defs"),
     exprs: ProgramList(Expr, "exprs"),
@@ -1047,6 +1063,8 @@ pub const ProgramBuilder = struct {
             .specs = .empty,
             .imported_fns = .empty,
             .fns = .empty,
+            .const_fn_evidence = .empty,
+            .const_fn_evidence_frame_root_counts = .empty,
             .defs = .empty,
             .nested_defs = .empty,
             .exprs = .empty,
@@ -1120,6 +1138,8 @@ pub const ProgramBuilder = struct {
         self.nested_defs.deinit(self.allocator);
         self.defs.deinit(self.allocator);
         self.fns.deinit(self.allocator);
+        self.const_fn_evidence.deinit(self.allocator);
+        self.const_fn_evidence_frame_root_counts.deinit(self.allocator);
         self.imported_fns.deinit(self.allocator);
         self.specs.deinit(self.allocator);
         self.types.deinit();
@@ -1130,6 +1150,26 @@ pub const ProgramBuilder = struct {
         const id: FnId = @enumFromInt(@as(u32, @intCast(self.fns.len())));
         try self.fns.append(self.allocator, .{ .source = source });
         return id;
+    }
+
+    pub fn addConstFnEvidence(self: *ProgramBuilder, values: []const check.ConstStore.ConstFnEvidence) std.mem.Allocator.Error!Span(check.ConstStore.ConstFnEvidence) {
+        const start: u32 = @intCast(self.const_fn_evidence.len());
+        try self.const_fn_evidence.appendSlice(self.allocator, values);
+        return .{ .start = start, .len = @intCast(values.len) };
+    }
+
+    pub fn addConstFnEvidenceFrameRootCounts(self: *ProgramBuilder, values: []const u32) std.mem.Allocator.Error!Span(u32) {
+        const start: u32 = @intCast(self.const_fn_evidence_frame_root_counts.len());
+        try self.const_fn_evidence_frame_root_counts.appendSlice(self.allocator, values);
+        return .{ .start = start, .len = @intCast(values.len) };
+    }
+
+    pub fn constFnEvidence(self: *const ProgramBuilder, span: Span(check.ConstStore.ConstFnEvidence)) []const check.ConstStore.ConstFnEvidence {
+        return self.const_fn_evidence.unsafeRawItemsForView()[span.start..][0..span.len];
+    }
+
+    pub fn constFnEvidenceFrameRootCounts(self: *const ProgramBuilder, span: Span(u32)) []const u32 {
+        return self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView()[span.start..][0..span.len];
     }
 
     pub fn fnCount(self: *const ProgramBuilder) usize {
@@ -1243,6 +1283,8 @@ pub const ProgramBuilder = struct {
             .specs = self.specs.unsafeRawItemsForView(),
             .imported_fns = self.imported_fns.unsafeRawItemsForView(),
             .fns = self.fns.unsafeRawItemsForView(),
+            .const_fn_evidence = self.const_fn_evidence.unsafeRawItemsForView(),
+            .const_fn_evidence_frame_root_counts = self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView(),
             .defs = self.defs.unsafeRawItemsForView(),
             .nested_defs = self.nested_defs.unsafeRawItemsForView(),
             .exprs = self.exprs.unsafeRawItemsForView(),

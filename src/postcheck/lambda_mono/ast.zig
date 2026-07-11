@@ -422,6 +422,8 @@ pub const Program = struct {
     next_symbol: u32,
     types: Type.Store,
     fns: ProgramList(Fn, "fns"),
+    const_fn_evidence: ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence"),
+    const_fn_evidence_frame_root_counts: ProgramList(u32, "const_fn_evidence_frame_root_counts"),
     exprs: ProgramList(Expr, "exprs"),
     pats: ProgramList(Pat, "pats"),
     stmts: ProgramList(Stmt, "stmts"),
@@ -465,6 +467,8 @@ pub const Program = struct {
         allocator: std.mem.Allocator,
         name_store: names.NameStore,
         string_literals: std.ArrayList(Mono.StringLiteral),
+        const_fn_evidence: std.ArrayList(check.ConstStore.ConstFnEvidence),
+        const_fn_evidence_frame_root_counts: std.ArrayList(u32),
     ) Program {
         return .{
             .allocator = allocator,
@@ -472,6 +476,8 @@ pub const Program = struct {
             .next_symbol = 0,
             .types = Type.Store.init(allocator),
             .fns = .empty,
+            .const_fn_evidence = ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence").fromArrayList(const_fn_evidence),
+            .const_fn_evidence_frame_root_counts = ProgramList(u32, "const_fn_evidence_frame_root_counts").fromArrayList(const_fn_evidence_frame_root_counts),
             .exprs = .empty,
             .pats = .empty,
             .stmts = .empty,
@@ -537,8 +543,18 @@ pub const Program = struct {
         self.pats.deinit(self.allocator);
         self.exprs.deinit(self.allocator);
         self.fns.deinit(self.allocator);
+        self.const_fn_evidence.deinit(self.allocator);
+        self.const_fn_evidence_frame_root_counts.deinit(self.allocator);
         self.types.deinit();
         self.names.deinit();
+    }
+
+    pub fn constFnEvidence(self: *const Program, span: Mono.Span(check.ConstStore.ConstFnEvidence)) []const check.ConstStore.ConstFnEvidence {
+        return self.const_fn_evidence.unsafeRawItemsForView()[span.start..][0..span.len];
+    }
+
+    pub fn constFnEvidenceFrameRootCounts(self: *const Program, span: Mono.Span(u32)) []const u32 {
+        return self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView()[span.start..][0..span.len];
     }
 
     pub fn addFn(self: *Program, fn_: Fn) std.mem.Allocator.Error!FnId {

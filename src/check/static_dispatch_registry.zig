@@ -811,8 +811,17 @@ pub const CheckedEvidence = union(enum) {
 /// A concrete method target together with evidence for the target's own
 /// evidence params (in the target scheme's canonical order); `nested` is a
 /// range into `StaticDispatchPlanTable.evidence_refs`.
+pub const EvidenceTargetInstantiation = union(enum(u8)) {
+    /// The target scheme has no variables and therefore no edge-specific
+    /// callable instantiation.
+    monomorphic,
+    /// Exact callable relation produced while discharging this edge.
+    callable: CheckedTypeId,
+};
+
 pub const EvidenceNode = struct {
     target: MethodTarget,
+    instantiation: EvidenceTargetInstantiation,
     nested: artifact_serialize.Span = .{},
 };
 

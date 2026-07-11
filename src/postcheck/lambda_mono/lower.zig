@@ -37,11 +37,15 @@ pub fn run(
     errdefer owned.deinit();
 
     var string_literals = owned.lifted.takeStringLiterals();
+    var const_fn_evidence = owned.lifted.const_fn_evidence.takeArrayList();
+    var const_fn_evidence_frame_root_counts = owned.lifted.const_fn_evidence_frame_root_counts.takeArrayList();
     var name_store = owned.lifted.names;
     owned.lifted.names = @import("check").CheckedNames.NameStore.init(allocator);
-    var program = Ast.Program.init(allocator, name_store, string_literals);
+    var program = Ast.Program.init(allocator, name_store, string_literals, const_fn_evidence, const_fn_evidence_frame_root_counts);
     name_store = undefined;
     string_literals = undefined;
+    const_fn_evidence = undefined;
+    const_fn_evidence_frame_root_counts = undefined;
     program.source_files = Ast.ProgramList([]const u8, "source_files").fromArrayList(owned.lifted.takeSourceFiles());
     errdefer program.deinit();
 
@@ -67,6 +71,8 @@ fn movedSolvedView(source: *const Solved.Program, moved: *const Ast.Program) Sol
             .next_symbol = lifted.next_symbol,
             .types = lifted.types,
             .imported_fns = lifted.imported_fns,
+            .const_fn_evidence = moved.const_fn_evidence.unsafeRawItemsForView(),
+            .const_fn_evidence_frame_root_counts = moved.const_fn_evidence_frame_root_counts.unsafeRawItemsForView(),
             .fns = lifted.fns,
             .exprs = lifted.exprs,
             .pats = lifted.pats,

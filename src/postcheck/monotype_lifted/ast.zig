@@ -142,6 +142,8 @@ pub const ProgramView = struct {
     types: Type.Store.View,
     imported_fns: []const ImportedFn,
     fns: []const Fn,
+    const_fn_evidence: []const check.ConstStore.ConstFnEvidence,
+    const_fn_evidence_frame_root_counts: []const u32,
     exprs: []const Expr,
     pats: []const Pat,
     stmts: []const Stmt,
@@ -366,6 +368,8 @@ pub const Program = struct {
     types: Type.Store,
     imported_fns: ProgramList(ImportedFn, "imported_fns"),
     fns: ProgramList(Fn, "fns"),
+    const_fn_evidence: ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence"),
+    const_fn_evidence_frame_root_counts: ProgramList(u32, "const_fn_evidence_frame_root_counts"),
     exprs: ProgramList(Expr, "exprs"),
     pats: ProgramList(Pat, "pats"),
     stmts: ProgramList(Stmt, "stmts"),
@@ -415,6 +419,8 @@ pub const Program = struct {
         name_store: names.NameStore,
         types: Type.Store,
         imported_fns: std.ArrayList(ImportedFn),
+        const_fn_evidence: std.ArrayList(check.ConstStore.ConstFnEvidence),
+        const_fn_evidence_frame_root_counts: std.ArrayList(u32),
         exprs: std.ArrayList(Expr),
         pats: std.ArrayList(Pat),
         stmts: std.ArrayList(Stmt),
@@ -447,6 +453,8 @@ pub const Program = struct {
             .types = types,
             .imported_fns = ProgramList(ImportedFn, "imported_fns").fromArrayList(imported_fns),
             .fns = .empty,
+            .const_fn_evidence = ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence").fromArrayList(const_fn_evidence),
+            .const_fn_evidence_frame_root_counts = ProgramList(u32, "const_fn_evidence_frame_root_counts").fromArrayList(const_fn_evidence_frame_root_counts),
             .exprs = ProgramList(Expr, "exprs").fromArrayList(exprs),
             .pats = ProgramList(Pat, "pats").fromArrayList(pats),
             .stmts = ProgramList(Stmt, "stmts").fromArrayList(stmts),
@@ -517,6 +525,8 @@ pub const Program = struct {
         self.pats.deinit(self.allocator);
         self.exprs.deinit(self.allocator);
         self.fns.deinit(self.allocator);
+        self.const_fn_evidence.deinit(self.allocator);
+        self.const_fn_evidence_frame_root_counts.deinit(self.allocator);
         self.imported_fns.deinit(self.allocator);
         self.types.deinit();
         self.names.deinit();
@@ -529,6 +539,8 @@ pub const Program = struct {
             .types = self.types.view(),
             .imported_fns = self.imported_fns.unsafeRawItemsForView(),
             .fns = self.fns.unsafeRawItemsForView(),
+            .const_fn_evidence = self.const_fn_evidence.unsafeRawItemsForView(),
+            .const_fn_evidence_frame_root_counts = self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView(),
             .exprs = self.exprs.unsafeRawItemsForView(),
             .pats = self.pats.unsafeRawItemsForView(),
             .stmts = self.stmts.unsafeRawItemsForView(),

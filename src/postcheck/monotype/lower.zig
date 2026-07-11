@@ -116,7 +116,6 @@ pub fn run(
         verifyMonotypeTypeStore(&program);
         verifyMonotypeCompletedTypeIds(&program);
         verifyMonotypeCallTargets(&program);
-        builder.countBy("evidence_missing", builder.evidence_missing_count);
         builder.spec_store.validateLookupIntegrity();
         verifyMonotypeSpecsReady(&program);
     }
@@ -169,9 +168,15 @@ const ConstNode = struct {
     id: checked.ConstNodeId,
 };
 
+const CallableInstantiation = struct {
+    view: ModuleView,
+    callable_ty: checked.CheckedTypeId,
+};
+
 const MethodLookup = struct {
     view: ModuleView,
     target: static_dispatch.MethodTarget,
+    instantiation: ?CallableInstantiation = null,
 };
 
 /// One resolved dispatch requirement supplied to a specialization: either a
@@ -190,14 +195,12 @@ const SpecEvidence = union(enum) {
     /// Checking rejected the edge's requirement (a reported missing method);
     /// the dispatch lowers to an explicit crash.
     checked_error,
-    /// Checking left the requirement unresolved (migration gap). Consuming
-    /// it falls back to owner derivation until the migration completes.
-    unavailable,
 };
 
 const SpecEvidenceTarget = struct {
     view: ModuleView,
     target: static_dispatch.MethodTarget,
+    instantiation: ?CallableInstantiation,
     nested: NestedSpecEvidence,
 };
 
@@ -241,14 +244,19 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
     return switch (a) {
         .target => |a_target| switch (b) {
             .target => |b_target| blk: {
+                if (!std.meta.eql(a_target.view.key, b_target.view.key)) break :blk false;
                 if (!std.meta.eql(a_target.target, b_target.target)) break :blk false;
+                if (a_target.instantiation) |a_instantiation| {
+                    const b_instantiation = b_target.instantiation orelse break :blk false;
+                    if (!std.meta.eql(a_instantiation.view.key, b_instantiation.view.key)) break :blk false;
+                    if (a_instantiation.callable_ty != b_instantiation.callable_ty) break :blk false;
+                } else if (b_target.instantiation != null) {
+                    break :blk false;
+                }
                 switch (a_target.nested) {
-                    // A synthesize marker resolves from the same concrete
-                    // callable this comparison already agrees on, so it is
-                    // compatible with any nested vector for the same target.
-                    .synthesize => break :blk true,
+                    .synthesize => if (b_target.nested != .synthesize) break :blk false,
                     .resolved => |a_nested| switch (b_target.nested) {
-                        .synthesize => break :blk true,
+                        .synthesize => break :blk false,
                         .resolved => |b_nested| {
                             if (a_nested.len != b_nested.len) break :blk false;
                             for (a_nested, b_nested) |a_entry, b_entry| {
@@ -267,7 +275,6 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
         },
         .unreachable_value => b == .unreachable_value,
         .checked_error => b == .checked_error,
-        .unavailable => b == .unavailable,
     };
 }
 
@@ -277,18 +284,6 @@ fn specEvidenceVectorEql(a: []const SpecEvidence, b: []const SpecEvidence) bool 
         if (!specEvidenceEql(a_entry, b_entry)) return false;
     }
     return true;
-}
-
-/// True when either vector contains an `unavailable` migration gap (agreement
-/// can only be asserted between fully-resolved vectors).
-fn evidenceVectorsHaveGaps(a: []const SpecEvidence, b: []const SpecEvidence) bool {
-    for (a) |entry| {
-        if (entry == .unavailable) return true;
-    }
-    for (b) |entry| {
-        if (entry == .unavailable) return true;
-    }
-    return false;
 }
 
 const MethodDispatch = struct {
@@ -585,10 +580,6 @@ const Builder = struct {
     /// Owns every materialized `SpecEvidence` tree; freed wholesale with the
     /// builder.
     evidence_arena: std.heap.ArenaAllocator,
-    /// Dispatch requirements whose checked evidence could not resolve
-    /// (migration gaps still covered by owner derivation); audited by the
-    /// total-dispatch migration before the derivation path is deleted.
-    evidence_missing_count: usize = 0,
 
     fn init(allocator: Allocator, modules: Common.CheckedModules, program: *Ast.Program, options: Options) Builder {
         var spec_store = specialize.SpecBuilder.init(allocator, &program.names, &program.types, &program.specs);
@@ -662,16 +653,6 @@ const Builder = struct {
     fn countBy(self: *Builder, comptime field: []const u8, amount: usize) void {
         if (self.counters) |counters| {
             @field(counters, field) += @intCast(amount);
-        }
-    }
-
-    /// Record one dispatch requirement the checked evidence could not cover
-    /// (owner derivation resolves it during the migration). The tagged debug
-    /// log drives the audit that must reach zero before derivation is deleted.
-    fn evidenceGap(self: *Builder, comptime reason: []const u8, context: []const u8) void {
-        self.evidence_missing_count += 1;
-        if (@import("builtin").mode == .Debug) {
-            std.log.scoped(.monotype).debug("evidence gap [" ++ reason ++ "]: {s}", .{context});
         }
     }
 
@@ -1221,6 +1202,98 @@ const Builder = struct {
         return try self.lowerTemplateWithMono(template_ref, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
     }
 
+    const StoredConstFnEvidence = struct {
+        nodes: []const check.ConstStore.ConstFnEvidence,
+        frame_root_counts: []const u32,
+    };
+
+    fn constFnEvidenceSlicesEqual(
+        left: []const check.ConstStore.ConstFnEvidence,
+        right: []const check.ConstStore.ConstFnEvidence,
+    ) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_node, right_node| {
+            if (!std.meta.eql(left_node, right_node)) return false;
+        }
+        return true;
+    }
+
+    /// Retain the exact dispatch vector selected for a specialization so a
+    /// compile-time function value can restore that vector without resolving
+    /// its requirements again.
+    fn constFnEvidence(self: *Builder, evidence: []const SpecEvidence) Allocator.Error!StoredConstFnEvidence {
+        var nodes = std.ArrayList(check.ConstStore.ConstFnEvidence).empty;
+        defer nodes.deinit(self.allocator);
+        try self.appendConstFnEvidence(&nodes, evidence);
+        return .{
+            .nodes = try self.evidence_arena.allocator().dupe(check.ConstStore.ConstFnEvidence, nodes.items),
+            .frame_root_counts = try self.evidence_arena.allocator().dupe(u32, &.{@intCast(evidence.len)}),
+        };
+    }
+
+    fn constFnEvidenceChain(self: *Builder, chain: EvidenceChain) Allocator.Error!StoredConstFnEvidence {
+        var nodes = std.ArrayList(check.ConstStore.ConstFnEvidence).empty;
+        defer nodes.deinit(self.allocator);
+        var frame_root_counts = std.ArrayList(u32).empty;
+        defer frame_root_counts.deinit(self.allocator);
+
+        var frame: ?*const EvidenceChain = &chain;
+        while (frame) |current| : (frame = current.parent) {
+            try frame_root_counts.append(self.allocator, @intCast(current.vector.len));
+            try self.appendConstFnEvidence(&nodes, current.vector);
+        }
+        return .{
+            .nodes = try self.evidence_arena.allocator().dupe(check.ConstStore.ConstFnEvidence, nodes.items),
+            .frame_root_counts = try self.evidence_arena.allocator().dupe(u32, frame_root_counts.items),
+        };
+    }
+
+    fn appendConstFnEvidence(
+        self: *Builder,
+        nodes: *std.ArrayList(check.ConstStore.ConstFnEvidence),
+        evidence: []const SpecEvidence,
+    ) Allocator.Error!void {
+        for (evidence) |entry| switch (entry) {
+            .target => |target| {
+                const target_index = nodes.items.len;
+                try nodes.append(self.allocator, undefined);
+                const nested: check.ConstStore.ConstFnNestedEvidence = switch (target.nested) {
+                    .synthesize => blk: {
+                        const nested_count: usize = switch (target.target.kind) {
+                            .procedure => |procedure| target.view.templates.get(procedure.template.template).evidence_params.len,
+                            .local_proc => Common.invariant("stored function target had unresolved local-procedure evidence"),
+                            .generated_structural_parser, .generated_structural_encoder => 0,
+                        };
+                        if (nested_count != 0) {
+                            Common.invariant("stored function target did not contain resolved nested evidence");
+                        }
+                        break :blk .{ .count = 0, .subtree_len = 0 };
+                    },
+                    .resolved => |resolved| blk: {
+                        const nested_start = nodes.items.len;
+                        try self.appendConstFnEvidence(nodes, resolved);
+                        break :blk .{
+                            .count = @intCast(resolved.len),
+                            .subtree_len = @intCast(nodes.items.len - nested_start),
+                        };
+                    },
+                };
+                nodes.items[target_index] = .{ .target = .{
+                    .view = .{ .bytes = target.view.key.bytes },
+                    .method = target.target,
+                    .instantiation = if (target.instantiation) |instantiation| .{
+                        .view = .{ .bytes = instantiation.view.key.bytes },
+                        .callable_ty = instantiation.callable_ty,
+                    } else null,
+                    .nested = nested,
+                } };
+            },
+            .structural => |kind| try nodes.append(self.allocator, .{ .structural = kind }),
+            .unreachable_value => try nodes.append(self.allocator, .unreachable_value),
+            .checked_error => try nodes.append(self.allocator, .checked_error),
+        };
+    }
+
     fn lowerTemplateWithMono(
         self: *Builder,
         template_ref: names.ProcTemplate,
@@ -1304,7 +1377,15 @@ const Builder = struct {
 
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const template = view.templates.get(template_ref.template);
-        const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
+        var fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
+        if (spec_evidence.len > template.evidence_params.len) {
+            Common.invariant("procedure specialization received more evidence than its checked requirements");
+        }
+        if (spec_evidence.len == template.evidence_params.len) {
+            const stored_evidence = try self.constFnEvidence(spec_evidence);
+            fn_template.const_evidence = try self.program.addConstFnEvidence(stored_evidence.nodes);
+            fn_template.const_evidence_frame_root_counts = try self.program.addConstFnEvidenceFrameRootCounts(stored_evidence.frame_root_counts);
+        }
 
         const Reservation = struct {
             def: Ast.DefId,
@@ -1447,47 +1528,21 @@ const Builder = struct {
             // checking resolved that edge's evidence (chain-free: concrete
             // targets, mono-default owners, structural, vacuous) as site
             // evidence keyed by the root's body expression.
-            var filled = false;
             if (try body_ctx.rootEdgeEvidence(view, template)) |root_evidence| {
                 body_ctx.evidence = .{ .vector = root_evidence };
-                filled = true;
-            } else if (template.body != .intrinsic_wrapper) {
-                // Root-edge request scheduled after checking output was sealed (eval/REPL
-                // entries): resolve the requirements from the template's own
-                // dispatcher paths over the requested callable — the sealed
-                // mono type carries the checker's defaults.
-                const synthesized = try body_ctx.synthesizeParamsEvidence(view, template, lower_fn_ty);
-                var complete = synthesized.len == template.evidence_params.len;
-                for (synthesized) |entry| {
-                    if (entry == .unavailable) complete = false;
-                }
-                if (complete) {
-                    body_ctx.evidence = .{ .vector = synthesized };
-                    filled = true;
-                }
-            }
-            if (!filled) {
-                // Requesting edges that predate full evidence threading (or
-                // counted gaps from checking) leave the vector short; owner
-                // derivation still resolves those requirements during the
-                // migration.
-                const proc_base = view.names.procBase(template_ref.proc_base);
-                const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
-                var short = template.evidence_params.len - spec_evidence.len;
-                while (short > 0) : (short -= 1) {
-                    self.evidenceGap("spec-vector-short", template_name);
-                    if (@import("builtin").mode == .Debug) {
-                        const params = view.templates.evidenceParams(&template);
-                        const missing = params[spec_evidence.len + short - 1];
-                        std.log.scoped(.monotype).debug("  in module: {s} missing param {d}: {s}", .{
-                            view.module_env.module_name,
-                            spec_evidence.len + short - 1,
-                            view.names.methodNameText(missing.method),
-                        });
-                    }
-                }
+            } else {
+                Common.invariant("procedure specialization did not receive its complete checked evidence vector");
             }
         }
+        if (fn_template.const_evidence_frame_root_counts.len == 0) {
+            const retained = try self.constFnEvidence(body_ctx.evidence.vector);
+            fn_template.const_evidence = try self.program.addConstFnEvidence(retained.nodes);
+            fn_template.const_evidence_frame_root_counts = try self.program.addConstFnEvidenceFrameRootCounts(retained.frame_root_counts);
+            self.program.setFnSource(reservation.fn_id, fn_template);
+        }
+        const lowered_template = self.lowered_templates.getPtr(reservation.fn_id) orelse
+            Common.invariant("procedure specialization lost its evidence record before body lowering");
+        lowered_template.evidence = body_ctx.evidence.vector;
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
         const root_fn_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
@@ -1577,18 +1632,10 @@ const Builder = struct {
             self.count("template_hits");
             switch (found) {
                 .local => |hit| {
-                    // Evidence is a function of the monomorphic type; two edges
-                    // requesting the same specialization must agree wherever both
-                    // resolved their requirements.
-                    if (@import("builtin").mode == .Debug) {
-                        const existing = self.lowered_templates.get(hit.fn_id) orelse
-                            Common.invariant("Monotype specialization index found a local template missing from lowering state");
-                        if (existing.evidence.len == evidence.len and
-                            !evidenceVectorsHaveGaps(existing.evidence, evidence) and
-                            !specEvidenceVectorEql(existing.evidence, evidence))
-                        {
-                            Common.invariant("specialization edges disagreed on dispatch evidence");
-                        }
+                    const existing = self.lowered_templates.get(hit.fn_id) orelse
+                        Common.invariant("Monotype specialization index found a local template missing from lowering state");
+                    if (!specEvidenceVectorEql(existing.evidence, evidence)) {
+                        Common.invariant("specialization edges disagreed on dispatch evidence");
                     }
                     try self.unifyRequestWithLocalHit(requester, fn_ty, hit);
                     return .{
@@ -2872,7 +2919,8 @@ const Builder = struct {
             request.ctx.deinit();
             self.allocator.destroy(request.ctx);
         }
-        const fn_template = request.fn_template;
+        var fn_template = request.fn_template;
+        const stored_evidence = try self.constFnEvidenceChain(request.ctx.evidence);
         const nested = switch (fn_template.fn_def) {
             .nested => |nested| nested,
             else => Common.invariant("local procedure specialization did not have a nested function identity"),
@@ -2882,6 +2930,21 @@ const Builder = struct {
         if (try self.spec_store.findLocal(nestedSpecIdentity(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
             self.count("nested_hits");
             try self.unifyRequestWithLocalHit(request.ctx.graph, fn_template.mono_fn_ty, hit);
+            var existing = self.program.fnSource(hit.fn_id);
+            const existing_nodes = self.program.constFnEvidence(existing.const_evidence);
+            const existing_frame_root_counts = self.program.constFnEvidenceFrameRootCounts(existing.const_evidence_frame_root_counts);
+            const existing_has_chain = existing_nodes.len > 0 or existing_frame_root_counts.len > 0;
+            const incoming_has_chain = stored_evidence.nodes.len > 0 or stored_evidence.frame_root_counts.len > 0;
+            if (!existing_has_chain and incoming_has_chain) {
+                existing.const_evidence = try self.program.addConstFnEvidence(stored_evidence.nodes);
+                existing.const_evidence_frame_root_counts = try self.program.addConstFnEvidenceFrameRootCounts(stored_evidence.frame_root_counts);
+                self.program.setFnSource(hit.fn_id, existing);
+            } else if (existing_has_chain != incoming_has_chain or
+                !constFnEvidenceSlicesEqual(existing_nodes, stored_evidence.nodes) or
+                !std.mem.eql(u32, existing_frame_root_counts, stored_evidence.frame_root_counts))
+            {
+                Common.invariant("nested specialization was requested with different dispatch evidence");
+            }
             switch (hit.status) {
                 .ready,
                 .lowering,
@@ -2892,6 +2955,8 @@ const Builder = struct {
             self.count("nested_misses");
         }
 
+        fn_template.const_evidence = try self.program.addConstFnEvidence(stored_evidence.nodes);
+        fn_template.const_evidence_frame_root_counts = try self.program.addConstFnEvidenceFrameRootCounts(stored_evidence.frame_root_counts);
         const fn_id = try self.program.addFn(fn_template);
         const spec = try self.addNestedSpecRecord(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest, fn_id);
         try self.lowered_nested_by_fn.put(fn_id, spec);
@@ -2922,6 +2987,8 @@ const Builder = struct {
                 .source_fn_ty = def_template.source_fn_ty,
                 .source_fn_key = def_template.source_fn_key,
                 .mono_fn_ty = try DraftTypeCell.fromActiveType(request.ctx.graph, def_template.mono_fn_ty),
+                .const_evidence = def_template.const_evidence,
+                .const_evidence_frame_root_counts = def_template.const_evidence_frame_root_counts,
             },
             .fn_id = draftFinalFn(fn_id),
             .args = lowered.args,
@@ -3850,7 +3917,7 @@ const Builder = struct {
         const expr = fn_view.bodies.expr(runtime.expr);
         const plan = dispatchPlanForRuntimeExpr(fn_view, runtime.expr);
         const plan_args = plan.argsSlice(fn_view.static_dispatch_plans);
-        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
+        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try graph.sealNode(callable_node);
         const fn_data = self.functionShape(callable_mono_ty, "stored parser constructor had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(fn_data.args));
@@ -3958,7 +4025,7 @@ const Builder = struct {
         const expr = fn_view.bodies.expr(runtime.expr);
         const plan = dispatchPlanForRuntimeExpr(fn_view, runtime.expr);
         const plan_args = plan.argsSlice(fn_view.static_dispatch_plans);
-        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
+        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try graph.sealNode(callable_node);
         const fn_data = self.functionShape(callable_mono_ty, "stored encoder_for constructor had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(fn_data.args));
@@ -5002,6 +5069,8 @@ const DraftFnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: DraftTypeCell,
+    const_evidence: Ast.Span(check.ConstStore.ConstFnEvidence) = Ast.Span(check.ConstStore.ConstFnEvidence).empty(),
+    const_evidence_frame_root_counts: Ast.Span(u32) = Ast.Span(u32).empty(),
 };
 
 const DraftFn = struct {
@@ -6013,6 +6082,8 @@ const BodyDraftStore = struct {
             .source_fn_ty = template.source_fn_ty,
             .source_fn_key = template.source_fn_key,
             .mono_fn_ty = try template.mono_fn_ty.seal(graph, sealer),
+            .const_evidence = template.const_evidence,
+            .const_evidence_frame_root_counts = template.const_evidence_frame_root_counts,
         };
     }
 
@@ -6483,8 +6554,6 @@ const BodyContext = struct {
     /// While recursively restoring a stored constant, the concrete type of the
     /// whole restored value. Nested stored closures use this to instantiate the
     /// owner callable's return when synthesizing the constant scheme's evidence.
-    restore_const_result_ty: ?Type.TypeId = null,
-
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
         ty: Type.TypeId,
@@ -6814,6 +6883,8 @@ const BodyContext = struct {
                 .source_fn_ty = source.source_fn_ty,
                 .source_fn_key = source.source_fn_key,
                 .mono_fn_ty = try self.draftTypeCell(source.mono_fn_ty),
+                .const_evidence = source.const_evidence,
+                .const_evidence_frame_root_counts = source.const_evidence_frame_root_counts,
             },
         });
     }
@@ -7290,7 +7361,6 @@ const BodyContext = struct {
         child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
-        child.restore_const_result_ty = self.restore_const_result_ty;
 
         var binder_iter = self.binders.iterator();
         while (binder_iter.next()) |entry| {
@@ -7985,13 +8055,6 @@ const BodyContext = struct {
     /// checked identity so every occurrence of the same checked root resolves
     /// to the same node within this instantiation context.
     fn instNode(self: *BodyContext, checked_ty: checked.CheckedTypeId) Allocator.Error!NodeId {
-        // A checked empty tag union has no source/backing identity worth
-        // sharing across instantiation sites. One checked id serves many
-        // unrelated row slots, so each occurrence instantiates independently.
-        switch (checkedPayload(self.view, checked_ty)) {
-            .empty_tag_union => return try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
-            else => {},
-        }
         const address = self.typeAddress(checked_ty);
         if (self.scopedNode(address)) |existing| return existing;
         const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
@@ -8035,11 +8098,7 @@ const BodyContext = struct {
                 variable.row_default,
             ) }),
             .empty_record => try self.graph.newNode(.empty_record),
-            // A checked empty tag union has no source/backing identity to
-            // preserve here. It enters the graph as explicit row evidence for
-            // this occurrence, and later sealing decides the final row from
-            // the complete instantiation evidence.
-            .empty_tag_union => try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
+            .empty_tag_union => try self.graph.newNode(.empty_tag_union),
             .alias => |alias| try self.graph.newNode(.{ .named = .{
                 .named_type = .{ .module = self.builder.declaredModuleForAlias(self.view, alias), .ty = checked_ty },
                 .def = try self.builder.typeDef(self.view, alias.origin_module, alias.name, alias.source_decl),
@@ -8435,6 +8494,8 @@ const BodyContext = struct {
         defer materialized_args.deinit(self.allocator);
 
         for (checked_args, arg_tys, 0..) |pattern_id, arg_ty, i| {
+            try self.graph.unify(try self.instNode(self.view.bodies.pattern(pattern_id).ty), try self.graph.importMono(arg_ty));
+            try self.graph.drainDirty();
             if (self.patternNeedsExplicitBinding(pattern_id)) {
                 const local = try self.addLocal(self.builder.symbols.fresh(), arg_ty);
                 args[i] = .{ .local = local, .ty = arg_ty };
@@ -14472,13 +14533,19 @@ const BodyContext = struct {
             Common.invariant("checked direct call arity differs from its function type");
         }
         const fn_node = try self.instNode(source_fn_ty);
+        const fn_graph = switch (self.graph.content(fn_node)) {
+            .func => |func| func,
+            else => Common.invariant("checked direct call had a non-function instantiation node"),
+        };
+        if (fn_graph.args.len != checked_args.len) {
+            Common.invariant("checked direct call graph arity differed from its argument span");
+        }
         const generated_arg_overrides = try self.allocator.alloc(?Type.TypeId, function.args.len);
         defer self.allocator.free(generated_arg_overrides);
         @memset(generated_arg_overrides, null);
         var saw_generated_opaque_evidence = false;
-        for (function.args, checked_args, 0..) |formal_ty, checked_arg, index| {
+        for (fn_graph.args, checked_args, 0..) |formal_node, checked_arg, index| {
             const arg_ty = caller.view.bodies.expr(checked_arg).ty;
-            const formal_node = try self.instNode(formal_ty);
             if (try caller.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
                 if (self.isGeneratedSpecializationEvidenceType(evidence_ty)) {
                     const evidence_snapshot = try self.graph.sealType(evidence_ty);
@@ -14495,23 +14562,23 @@ const BodyContext = struct {
                 try self.graph.unify(formal_node, try caller.instNode(arg_ty));
             }
         }
-        try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+        try self.graph.unify(fn_graph.ret, try caller.instNode(checked_ret_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            try self.graph.unify(fn_graph.ret, try self.graph.importMono(expected));
         }
         try self.graph.drainDirty();
         if (saw_generated_opaque_evidence) {
             const args = try self.allocator.alloc(Type.TypeId, function.args.len);
             defer self.allocator.free(args);
-            for (function.args, generated_arg_overrides, 0..) |formal_ty, override, index| {
+            for (fn_graph.args, generated_arg_overrides, 0..) |formal_node, override, index| {
                 args[index] = if (override) |ty|
                     ty
                 else
-                    try self.graph.sealNode(try self.instNode(formal_ty));
+                    try self.graph.sealNode(formal_node);
             }
             const generated_fn_ty = try self.builder.program.types.add(.{ .func = .{
                 .args = try self.builder.program.types.addSpan(args),
-                .ret = try self.graph.sealNode(try self.instNode(function.ret)),
+                .ret = try self.graph.sealNode(fn_graph.ret),
             } });
             return generated_fn_ty;
         }
@@ -14521,18 +14588,22 @@ const BodyContext = struct {
     fn instantiateDispatchPlanCallTypeFromCaller(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
+        dispatcher: static_dispatch.StaticDispatchDispatcher,
+        dispatcher_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
         operands: []const static_dispatch.StaticDispatchOperand,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        const fn_node = try self.instantiateDispatchPlanCallNodeFromCaller(source_fn_ty, caller, checked_ret_ty, operands, expected_ret_ty);
+        const fn_node = try self.instantiateDispatchPlanCallNodeFromCaller(source_fn_ty, dispatcher, dispatcher_ty, caller, checked_ret_ty, operands, expected_ret_ty);
         return try self.activeTypeFromNode(fn_node);
     }
 
     fn instantiateDispatchPlanCallNodeFromCaller(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
+        dispatcher: static_dispatch.StaticDispatchDispatcher,
+        dispatcher_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
         operands: []const static_dispatch.StaticDispatchOperand,
@@ -14543,12 +14614,27 @@ const BodyContext = struct {
             Common.invariant("checked dispatch plan arity differs from its function type");
         }
         const fn_node = try self.instNode(source_fn_ty);
-        for (function.args, operands) |formal_ty, operand| {
-            try self.relateFormalToOperand(formal_ty, caller, operand);
+        const fn_graph = switch (self.graph.content(fn_node)) {
+            .func => |func| func,
+            else => Common.invariant("checked dispatch plan had a non-function instantiation node"),
+        };
+        if (fn_graph.args.len != operands.len) {
+            Common.invariant("checked dispatch plan graph arity differed from its operand span");
         }
-        try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+        switch (dispatcher) {
+            .arg => |index| {
+                if (index >= fn_graph.args.len) Common.invariant("dispatch plan dispatcher argument index was outside the callable graph");
+                const dispatcher_node = try caller.instNode(dispatcher_ty);
+                try self.graph.unify(fn_graph.args[index], dispatcher_node);
+            },
+            .type_only => {},
+        }
+        for (fn_graph.args, operands) |formal_node, operand| {
+            try self.relateFormalToOperand(formal_node, caller, operand);
+        }
+        try self.graph.unify(fn_graph.ret, try caller.instNode(checked_ret_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.activeNodeFromType(expected));
+            try self.graph.unify(fn_graph.ret, try self.activeNodeFromType(expected));
         }
         try self.graph.drainDirty();
         return fn_node;
@@ -14556,27 +14642,14 @@ const BodyContext = struct {
 
     fn relateFormalToOperand(
         self: *BodyContext,
-        formal_ty: checked.CheckedTypeId,
+        formal_node: NodeId,
         caller: *BodyContext,
         operand: static_dispatch.StaticDispatchOperand,
     ) Allocator.Error!void {
         switch (operand) {
             .checked_expr => |checked_arg| {
                 const arg_ty = caller.view.bodies.expr(checked_arg).ty;
-                const formal_node = try self.instNode(formal_ty);
-                if (try caller.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
-                    if (self.isGeneratedSpecializationEvidenceType(evidence_ty)) {
-                        const evidence_snapshot = try self.graph.sealType(evidence_ty);
-                        try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_snapshot)), formal_node);
-                    } else if (self.isGeneratedOpaqueEvidenceType(evidence_ty)) {
-                        try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_ty)), formal_node);
-                    } else {
-                        try self.graph.unify(formal_node, try caller.instNode(arg_ty));
-                        try self.graph.unify(formal_node, try self.graph.importMono(evidence_ty));
-                    }
-                } else {
-                    try self.graph.unify(formal_node, try caller.instNode(arg_ty));
-                }
+                try self.graph.unify(formal_node, try caller.instNode(arg_ty));
             },
             .generated_interpolation_iter,
             .generated_numeral,
@@ -14598,12 +14671,19 @@ const BodyContext = struct {
             Common.invariant("checked from_numeral plan arity differs from its function type");
         }
         const fn_node = try self.instNode(source_fn_ty);
+        const fn_graph = switch (self.graph.content(fn_node)) {
+            .func => |func| func,
+            else => Common.invariant("checked from_numeral plan had a non-function instantiation node"),
+        };
+        if (fn_graph.args.len != operands.len) {
+            Common.invariant("checked from_numeral plan graph arity differed from its operand span");
+        }
         // The numeral expression's checked type is the converted value type;
         // the plan's checked structure relates it to the Try-shaped return.
         try self.graph.unify(try caller.instNode(checked_ret_ty), try self.graph.importMono(target_ty));
         try self.graph.unify(try self.instNode(checked_ret_ty), try self.graph.importMono(target_ty));
-        for (function.args, operands) |formal_ty, operand| {
-            try self.relateFormalToOperand(formal_ty, caller, operand);
+        for (fn_graph.args, operands) |formal_node, operand| {
+            try self.relateFormalToOperand(formal_node, caller, operand);
         }
         try self.graph.drainDirty();
         return try self.activeTypeFromNode(fn_node);
@@ -14616,20 +14696,39 @@ const BodyContext = struct {
         plan_fn_ty: checked.CheckedTypeId,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
+        return try self.activeTypeFromNode(try self.instantiateTargetFromPlanNode(source_fn_ty, plan_ctx, plan_fn_ty, expected_ret_ty));
+    }
+
+    fn instantiateTargetFromPlanNode(
+        self: *BodyContext,
+        source_fn_ty: checked.CheckedTypeId,
+        plan_ctx: *BodyContext,
+        plan_fn_ty: checked.CheckedTypeId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!NodeId {
         const function = self.checkedFunctionType(source_fn_ty);
         const plan_function = plan_ctx.checkedFunctionType(plan_fn_ty);
         if (function.args.len != plan_function.args.len) {
             Common.invariant("checked dispatch target arity differed from its dispatch plan");
         }
         const fn_node = try self.instNode(source_fn_ty);
+        const fn_graph = switch (self.graph.content(fn_node)) {
+            .func => |func| func,
+            else => Common.invariant("checked dispatch target had a non-function instantiation node"),
+        };
+        const plan_node = try plan_ctx.instNode(plan_fn_ty);
+        const plan_graph = switch (self.graph.content(plan_node)) {
+            .func => |func| func,
+            else => Common.invariant("checked dispatch plan had a non-function instantiation node"),
+        };
         if (expected_ret_ty) |expected| {
             const expected_node = try self.activeNodeFromType(expected);
-            try self.graph.unify(try plan_ctx.instNode(plan_function.ret), expected_node);
-            try self.graph.unify(try self.instNode(function.ret), expected_node);
+            try self.graph.unify(plan_graph.ret, expected_node);
+            try self.graph.unify(fn_graph.ret, expected_node);
         }
-        try self.graph.unify(fn_node, try plan_ctx.instNode(plan_fn_ty));
+        try self.graph.unify(fn_node, plan_node);
         try self.graph.drainDirty();
-        return try self.activeTypeFromNode(fn_node);
+        return fn_node;
     }
 
     fn instantiateTargetCallTypePreservingSourceArgsAndRet(
@@ -15231,7 +15330,9 @@ const BodyContext = struct {
         template: checked.CheckedProcedureTemplate,
     ) Allocator.Error!?[]const SpecEvidence {
         const refs = view.static_dispatch_plans.siteEvidence(root_expr) orelse return null;
-        if (refs.len != template.evidence_params.len) return null;
+        if (refs.len != template.evidence_params.len) {
+            Common.invariant("compile-time root evidence length differed from its procedure template");
+        }
         return try self.materializeEvidence(refs);
     }
 
@@ -15285,6 +15386,8 @@ const BodyContext = struct {
             const eval_root = store_view.compile_time_roots.root(body.root);
             if (try self.rootEdgeEvidenceByExpr(store_view, eval_root.expr, entry_template)) |root_evidence| {
                 body_ctx.evidence = .{ .vector = root_evidence };
+            } else {
+                Common.invariant("compile-time evaluation template did not contain its checked root evidence");
             }
         }
         defer body_ctx.deinit();
@@ -15320,10 +15423,6 @@ const BodyContext = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const previous_restore_const_result_ty = self.restore_const_result_ty;
-        if (previous_restore_const_result_ty == null) self.restore_const_result_ty = ty;
-        defer self.restore_const_result_ty = previous_restore_const_result_ty;
-
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
@@ -15668,10 +15767,21 @@ const BodyContext = struct {
             return try self.restoreConstEncoderForRuntimeFn(store_view, fn_value, ty);
         }
         const template = try self.builder.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
-        if (fn_value.captures.len != 0) {
-            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty);
+        const retained_evidence = if (fn_value.evidence_frame_root_counts.len > 0)
+            try self.materializeConstFnEvidence(fn_value)
+        else
+            EvidenceChain{};
+        const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
+        const checked_template = templateForConstFnDef(fn_value.fn_def);
+        if (fn_value.evidence_frame_root_counts.len == 0 and
+            fn_view.templates.get(checked_template.template).evidence_params.len > 0)
+        {
+            Common.invariant("stored function did not contain its required evidence chain");
         }
-        const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template);
+        if (fn_value.captures.len != 0) {
+            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty, retained_evidence);
+        }
+        const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template, retained_evidence);
         return try self.addExpr(.{
             .ty = self.builder.program.fnSource(mono_fn_id).mono_fn_ty,
             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(mono_fn_id) } },
@@ -15682,16 +15792,17 @@ const BodyContext = struct {
         self: *BodyContext,
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
+        retained_evidence: EvidenceChain,
     ) Allocator.Error!Ast.FnId {
         return switch (template.fn_def) {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-                fn_ctx.evidence = self.restore_evidence;
+                fn_ctx.evidence = retained_evidence;
                 defer fn_ctx.deinit();
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
             },
-            else => try self.builder.lowerFnTemplateDefFromContext(self, template, self.restore_evidence.vector),
+            else => try self.builder.lowerFnTemplateDefFromContext(self, template, retained_evidence.vector),
         };
     }
 
@@ -15702,10 +15813,11 @@ const BodyContext = struct {
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
         ty: Type.TypeId,
+        retained_evidence: EvidenceChain,
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-        fn_ctx.evidence = self.restore_evidence;
+        fn_ctx.evidence = retained_evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
@@ -15770,20 +15882,6 @@ const BodyContext = struct {
                     .site = nested.site,
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                 } };
-                // A compile-time-evaluated closure keeps its dispatch evidence
-                // params even when the outer scheme is concrete (a concrete
-                // captured `n` still selects `plus`), but a concrete use site
-                // carries no checked site evidence to fill them. Resolve the
-                // owner scheme's evidence params from its checked dispatcher
-                // paths over the closure's concrete callable, mirroring the
-                // compiler-generated-edge evidence construction, so the nested
-                // body's constraint refs at depth 0 resolve.
-                if (self.restore_evidence.vector.len == 0) {
-                    const result_ty = self.restore_const_result_ty orelse ty;
-                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty, result_ty)) |synthesized| {
-                        fn_ctx.evidence = .{ .vector = synthesized };
-                    }
-                }
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
         }
@@ -15846,7 +15944,7 @@ const BodyContext = struct {
         const expr = fn_view.bodies.expr(runtime.expr);
         const plan = dispatchPlanForRuntimeExpr(fn_view, runtime.expr);
         const plan_args = plan.argsSlice(fn_view.static_dispatch_plans);
-        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
+        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try self.graph.sealNode(callable_node);
         const fn_data = self.builder.functionShape(callable_mono_ty, "stored parser constructor had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
@@ -15939,7 +16037,7 @@ const BodyContext = struct {
         const expr = fn_view.bodies.expr(runtime.expr);
         const plan = dispatchPlanForRuntimeExpr(fn_view, runtime.expr);
         const plan_args = plan.argsSlice(fn_view.static_dispatch_plans);
-        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
+        const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try self.graph.sealNode(callable_node);
         const fn_data = self.builder.functionShape(callable_mono_ty, "stored encoder_for constructor had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
@@ -16820,7 +16918,20 @@ const BodyContext = struct {
         call_ctx.source_region_override = self.source_region_override;
         call_ctx.current_entry_root = self.current_entry_root;
 
-        var callable_mono_ty = try call_ctx.instantiateDispatchPlanCallTypeFromCaller(plan.callable_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
+        const callable_node = try call_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
+        if (self.planUnexecutable(plan) == null) {
+            const resolution = self.evidenceResolution(plan) orelse
+                Common.invariant("runtime method call had no StaticDispatchResolution evidence");
+            switch (resolution) {
+                .target => |initial_lookup| if (self.generatedStructuralDispatchKind(initial_lookup) == null) {
+                    const target_node = try self.methodTargetNodeFromPlan(initial_lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
+                    try self.graph.unify(callable_node, target_node);
+                    try self.graph.drainDirty();
+                },
+                .structural => {},
+            }
+        }
+        var callable_mono_ty = try call_ctx.activeTypeFromNode(callable_node);
         var plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
         const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
@@ -16846,23 +16957,7 @@ const BodyContext = struct {
                         .generated_quote,
                         => {},
                     }
-                    var lowered_ty = try self.exprType(lowered);
-                    if (methodOwnerFromType(&self.builder.program.types, lowered_ty) == null and
-                        methodOwnerFromType(&self.builder.program.types, plan_ret_ty) != null and
-                        plan.result_mode == .value)
-                    {
-                        switch (plan_args[index]) {
-                            .checked_expr => |expr| {
-                                try self.constrainTypeToMono(self.view.bodies.expr(expr).ty, plan_ret_ty);
-                                lowered_ty = try self.activeTypeFromType(plan_ret_ty);
-                                self.draft.exprs.items[@intFromEnum(lowered)].ty = try self.draftTypeCell(lowered_ty);
-                            },
-                            .generated_interpolation_iter,
-                            .generated_numeral,
-                            .generated_quote,
-                            => {},
-                        }
-                    }
+                    const lowered_ty = try self.exprType(lowered);
                     pre_lowered = .{
                         .index = index,
                         .expr = lowered,
@@ -16904,7 +16999,7 @@ const BodyContext = struct {
                 .checked_error => "method dispatch failed to check",
             });
         }
-        const lookup = self.dispatchTarget(plan, dispatcher_ty);
+        const lookup = self.dispatchTarget(plan);
         if (lookup == null) {
             return switch (plan.result_mode) {
                 // `.equality` and `.hash` are both handled by lowerStructuralEquality,
@@ -17002,15 +17097,12 @@ const BodyContext = struct {
 
         const callable_mono_ty = try call_ctx.instantiateNumeralPlanCallType(plan.callable_ty, self, checked_ret_ty, target_ty, plan_args);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
-        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
-        defer self.allocator.free(plan_arg_tys);
         const try_ty = plan_fn_data.ret;
 
-        const dispatcher_ty = try self.dispatcherMonoType(plan, plan_arg_tys);
-        const resolved = self.dispatchTarget(plan, dispatcher_ty) orelse
+        const resolved = self.dispatchTarget(plan) orelse
             Common.invariant("checked from_numeral dispatch unexpectedly resolved to structural equality");
 
-        const target_mono_ty = try self.methodTargetMonoTypePreservingSourceArgsAndRet(resolved, try_ty);
+        const target_mono_ty = try self.activeTypeFromNode(try self.methodTargetNodeFromPlan(resolved, &call_ctx, plan.callable_ty, try_ty));
         const target_fn_data = self.builder.functionShape(target_mono_ty, "checked from_numeral target had a non-function type");
         if (!self.sameType(target_fn_data.ret, try_ty)) {
             Common.invariant("checked from_numeral target return type differed from dispatch plan return type");
@@ -17584,23 +17676,28 @@ const BodyContext = struct {
         call_ctx.current_entry_root = self.current_entry_root;
 
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
-        const callable_mono_ty = try call_ctx.instantiateDispatchPlanCallTypeFromCaller(plan.callable_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
+        const callable_node = try call_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, plan.dispatcher, plan.dispatcher_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
+        if (self.planUnexecutable(plan) == null) {
+            const resolution = self.evidenceResolution(plan) orelse
+                Common.invariant("runtime method result had no StaticDispatchResolution evidence");
+            switch (resolution) {
+                .target => |lookup| if (self.generatedStructuralDispatchKind(lookup) == null) {
+                    const target_node = try self.methodTargetNodeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
+                    try self.graph.unify(callable_node, target_node);
+                    try self.graph.drainDirty();
+                },
+                .structural => {},
+            }
+        }
+        const callable_mono_ty = try call_ctx.activeTypeFromNode(callable_node);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
-        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
-        defer self.allocator.free(plan_arg_tys);
         const plan_ret_ty = plan_fn_data.ret;
-        const dispatcher_ty = try self.dispatcherMonoType(plan, plan_arg_tys);
 
-        // The dispatcher may not be solved yet when this runs for argument
-        // evidence; the target then resolves when the expression itself
-        // lowers, and the plan's return carries the evidence for now.
-        if (methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null or
-            self.planUnexecutable(plan) != null)
-        {
+        if (self.planUnexecutable(plan) != null) {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const resolved = self.dispatchTarget(plan, dispatcher_ty) orelse {
+        const resolved = self.dispatchTarget(plan) orelse {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         };
@@ -17652,10 +17749,8 @@ const BodyContext = struct {
                 return .{ .target = try self.materializeEvidenceTarget(node) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse {
-                    self.builder.evidenceGap("materialize-chain-miss", "");
-                    return .unavailable;
-                };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("checked evidence reference was absent from its lexical chain");
                 return entry;
             },
             .structural => |kind| return .{ .structural = kind },
@@ -17670,8 +17765,74 @@ const BodyContext = struct {
         out.* = .{
             .view = self.methodLookupForResolvedTarget(node.target).view,
             .target = node.target,
+            .instantiation = switch (node.instantiation) {
+                .monomorphic => null,
+                .callable => |callable_ty| .{ .view = self.view, .callable_ty = callable_ty },
+            },
             .nested = .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) },
         };
+        return out;
+    }
+
+    fn materializeConstFnEvidence(self: *BodyContext, fn_value: check.ConstStore.ConstFn) Allocator.Error!EvidenceChain {
+        var cursor: usize = 0;
+        const arena = self.builder.evidence_arena.allocator();
+        const vectors = try arena.alloc([]const SpecEvidence, fn_value.evidence_frame_root_counts.len);
+        for (fn_value.evidence_frame_root_counts, 0..) |root_count, index| {
+            vectors[index] = try self.materializeConstFnEvidenceVector(fn_value.evidence, &cursor, root_count);
+        }
+        if (cursor != fn_value.evidence.len) {
+            Common.invariant("stored function evidence contained unreferenced nodes");
+        }
+        if (vectors.len == 0) return .{};
+
+        var restored = EvidenceChain{ .vector = vectors[vectors.len - 1] };
+        var index = vectors.len - 1;
+        while (index > 0) {
+            index -= 1;
+            const parent = try arena.create(EvidenceChain);
+            parent.* = restored;
+            restored = .{ .vector = vectors[index], .parent = parent };
+        }
+        return restored;
+    }
+
+    fn materializeConstFnEvidenceVector(
+        self: *BodyContext,
+        nodes: []const check.ConstStore.ConstFnEvidence,
+        cursor: *usize,
+        count: u32,
+    ) Allocator.Error![]const SpecEvidence {
+        const arena = self.builder.evidence_arena.allocator();
+        const out = try arena.alloc(SpecEvidence, count);
+        for (out) |*entry| {
+            if (cursor.* >= nodes.len) Common.invariant("stored function evidence ended before its declared vector length");
+            const stored = nodes[cursor.*];
+            cursor.* += 1;
+            entry.* = switch (stored) {
+                .target => |target| blk: {
+                    const materialized = try arena.create(SpecEvidenceTarget);
+                    const nested_start = cursor.*;
+                    const nested_vector = try self.materializeConstFnEvidenceVector(nodes, cursor, target.nested.count);
+                    if (cursor.* - nested_start != target.nested.subtree_len) {
+                        Common.invariant("stored function nested evidence length differed from its subtree");
+                    }
+                    materialized.* = .{
+                        .view = self.builder.moduleForDigest(target.view),
+                        .target = target.method,
+                        .instantiation = if (target.instantiation) |instantiation| .{
+                            .view = self.builder.moduleForDigest(instantiation.view),
+                            .callable_ty = instantiation.callable_ty,
+                        } else null,
+                        .nested = .{ .resolved = nested_vector },
+                    };
+                    break :blk .{ .target = materialized };
+                },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
         return out;
     }
 
@@ -17693,16 +17854,17 @@ const BodyContext = struct {
                 return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse return .{ .resolved = &.{} };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("method target evidence was absent from its lexical chain");
                 return switch (entry) {
                     .target => |target| switch (target.nested) {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error => Common.invariant("method target selected non-target checked evidence"),
                 };
             },
-            .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
+            .structural, .checked_error, .unreachable_dispatch => Common.invariant("method target evidence requested for a non-target resolution"),
         }
     }
 
@@ -17715,16 +17877,17 @@ const BodyContext = struct {
                 return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
             },
             .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse return .{ .resolved = &.{} };
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("iterator target evidence was absent from its lexical chain");
                 return switch (entry) {
                     .target => |target| switch (target.nested) {
                         .resolved => |nested| .{ .resolved = nested },
                         .synthesize => .synthesize,
                     },
-                    .structural, .unreachable_value, .checked_error, .unavailable => .{ .resolved = &.{} },
+                    .structural, .unreachable_value, .checked_error => Common.invariant("iterator target selected non-target checked evidence"),
                 };
             },
-            .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
+            .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator target evidence requested for a non-target resolution"),
         }
     }
 
@@ -17735,27 +17898,32 @@ const BodyContext = struct {
         structural,
     };
 
-    /// The plan's checked (or edge-supplied) resolution, if the migration
-    /// has one for it. Null means owner derivation still decides
-    /// (unresolved plans, unavailable edge evidence, checked errors).
-    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, count_gaps: bool) ?EvidenceResolved {
+    /// The plan's checked or edge-supplied resolution. Null is reserved for
+    /// checked-error and explicitly unreachable dispatches.
+    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?EvidenceResolved {
         switch (plan.resolution) {
-            .direct => |node_id| return .{ .target = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target) },
-            .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse {
-                    if (count_gaps) self.builder.evidenceGap("dispatch-chain-miss", self.view.names.methodNameText(plan.method));
-                    return null;
+            .direct => |node_id| {
+                const node = self.view.static_dispatch_plans.evidenceNode(node_id);
+                var lookup = self.methodLookupForResolvedTarget(node.target);
+                lookup.instantiation = switch (node.instantiation) {
+                    .monomorphic => null,
+                    .callable => |callable_ty| .{ .view = self.view, .callable_ty = callable_ty },
                 };
+                return .{ .target = lookup };
+            },
+            .constraint => |constraint_ref| {
+                const entry = self.evidence.at(constraint_ref) orelse
+                    Common.invariant("dispatch resolution evidence was absent from its lexical chain");
                 return switch (entry) {
-                    .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
+                    .target => |target| .{ .target = .{
+                        .view = target.view,
+                        .target = target.target,
+                        .instantiation = target.instantiation,
+                    } },
                     .structural => .structural,
                     // Unreachable and checked-error dispatches crash before
                     // target resolution.
                     .unreachable_value, .checked_error => null,
-                    .unavailable => blk: {
-                        if (count_gaps) self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method));
-                        break :blk null;
-                    },
                 };
             },
             .structural => return .structural,
@@ -17776,52 +17944,22 @@ const BodyContext = struct {
             .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
                 .unreachable_value => .unreachable_value,
                 .checked_error => .checked_error,
-                .target, .structural, .unavailable => null,
-            } else null,
+                .target, .structural => null,
+            } else Common.invariant("dispatch executability evidence was absent from its lexical chain"),
             .direct, .structural => null,
         };
-    }
-
-    /// Iterator-call twin of `debugCompareDerivation`.
-    fn debugCompareIteratorDerivation(self: *BodyContext, dispatcher_ty: Type.TypeId, method: names.MethodNameId, consumed: MethodLookup) void {
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
-        const derived = self.builder.lookupMethodTarget(owner, self.view, method) orelse return;
-        if (!std.meta.eql(consumed.target, derived.target)) {
-            Common.invariant("iterator dispatch evidence target disagreed with the owner-derivation target");
-        }
     }
 
     fn dispatchTarget(
         self: *BodyContext,
         plan: static_dispatch.StaticDispatchCallPlan,
-        dispatcher_ty: Type.TypeId,
     ) ?MethodLookup {
-        const resolution = self.evidenceResolution(plan, true) orelse
+        const resolution = self.evidenceResolution(plan) orelse
             Common.invariant("dispatch plan reached monotype lowering without a resolution");
-        // Debug audit: where owner derivation can still resolve the dispatch,
-        // it must agree with the consumed evidence.
-        if (@import("builtin").mode == .Debug) self.debugCompareDerivation(plan, dispatcher_ty, resolution);
         return switch (resolution) {
             .target => |lookup| lookup,
             .structural => null,
         };
-    }
-
-    /// Migration audit: where owner derivation can still resolve the dispatch,
-    /// it must agree with the consumed evidence. Derivation being blind (no
-    /// owner, or registry miss) while evidence resolves is the migration's
-    /// point, not a bug.
-    fn debugCompareDerivation(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan, dispatcher_ty: Type.TypeId, resolution: EvidenceResolved) void {
-        const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse return;
-        const derived = self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse return;
-        switch (resolution) {
-            .target => |lookup| {
-                if (!std.meta.eql(lookup.target, derived.target)) {
-                    Common.invariant("dispatch evidence target disagreed with the owner-derivation target");
-                }
-            },
-            .structural => Common.invariant("dispatch evidence chose structural but owner derivation found a target"),
-        }
     }
 
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
@@ -17884,19 +18022,27 @@ const BodyContext = struct {
         plan_callable_ty: checked.CheckedTypeId,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        var target_ctx = try self.methodTargetContext(lookup);
-        defer target_ctx.deinit();
-        return try target_ctx.instantiateTargetFromPlan(lookup.target.callable_ty, plan_ctx, plan_callable_ty, expected_ret_ty);
+        return try self.activeTypeFromNode(try self.methodTargetNodeFromPlan(lookup, plan_ctx, plan_callable_ty, expected_ret_ty));
     }
 
-    fn methodTargetMonoTypePreservingSourceArgsAndRet(
+    fn methodTargetNodeFromPlan(
         self: *BodyContext,
         lookup: MethodLookup,
-        ret_ty: Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
+        plan_ctx: *BodyContext,
+        plan_callable_ty: checked.CheckedTypeId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!NodeId {
         var target_ctx = try self.methodTargetContext(lookup);
         defer target_ctx.deinit();
-        return try target_ctx.instantiateTargetCallTypePreservingSourceArgsAndRet(lookup.target.callable_ty, ret_ty);
+        const target_node = try target_ctx.instantiateTargetFromPlanNode(lookup.target.callable_ty, plan_ctx, plan_callable_ty, expected_ret_ty);
+        if (lookup.instantiation) |instantiation| {
+            var edge_ctx = try BodyContext.init(self.allocator, self.builder, instantiation.view, self.owner_template, self.graph, self.draft);
+            defer edge_ctx.deinit();
+            const edge_node = try edge_ctx.instNode(instantiation.callable_ty);
+            try self.graph.unify(target_node, edge_node);
+            try self.graph.drainDirty();
+        }
+        return target_node;
     }
 
     fn methodTargetMonoTypeFromArgs(
@@ -17985,45 +18131,6 @@ const BodyContext = struct {
         return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
     }
 
-    /// Evidence vector for a compile-time-evaluated closure restored without a
-    /// use-site vector: resolve the owner scheme's evidence params from its
-    /// checked dispatcher paths over the closure's concrete restored callable.
-    ///
-    /// The owner scheme's evidence-param paths run over the owner's whole
-    /// callable (a `constraint(0, k)` in the closure body forwards to the
-    /// owner's `k`th param). Instantiate the owner root, pin its return to the
-    /// result value that created this stored closure, and synthesize each param's
-    /// target over the resulting concrete owner callable. When the owner returns
-    /// the closure directly, that result is the restored closure type itself; an
-    /// ambient restored constant result only applies when the owner returns an
-    /// aggregate that contains this closure.
-    fn synthesizeRestoredClosureEvidence(
-        self: *BodyContext,
-        owner_view: ModuleView,
-        owner_ref: names.ProcTemplate,
-        ty: Type.TypeId,
-        owner_result_ty: Type.TypeId,
-    ) Allocator.Error!?[]const SpecEvidence {
-        const owner_template = owner_view.templates.get(owner_ref.template);
-        if (owner_template.evidence_params.len == 0) return null;
-
-        const owner_node = try self.instNode(owner_template.checked_fn_root);
-        const owner_mono_ty = try self.activeTypeFromNode(owner_node);
-        const owner_ret = self.functionReturnType(owner_mono_ty);
-        switch (self.builder.shapeContent(ty)) {
-            .func => {},
-            else => Common.invariant("stored capturing function had a non-function restored type"),
-        }
-        const restored_owner_result_ty = switch (self.builder.shapeContent(owner_ret)) {
-            .func => ty,
-            else => owner_result_ty,
-        };
-        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(restored_owner_result_ty));
-        try self.graph.drainDirty();
-        const owner_callable_ty = try self.activeTypeFromNode(owner_node);
-        return try self.synthesizeParamsEvidence(owner_view, owner_template, owner_callable_ty);
-    }
-
     /// Resolve a template's requirements from its checked dispatcher paths
     /// over the concrete monomorphic callable.
     fn synthesizeParamsEvidence(
@@ -18040,14 +18147,10 @@ const BodyContext = struct {
         for (params, 0..) |param, i| {
             const path = view.templates.evidenceParamPath(param);
             if (path.len == 0) {
-                self.builder.evidenceGap("synthesize-pathless", view.names.methodNameText(param.method));
-                out[i] = .unavailable;
-                continue;
+                Common.invariant("compiler-generated method edge did not contain a dispatcher path");
             }
             const component_ty = try self.walkEvidencePath(view, callable_mono_ty, path) orelse {
-                self.builder.evidenceGap("synthesize-path-miss", view.names.methodNameText(param.method));
-                out[i] = .unavailable;
-                continue;
+                Common.invariant("compiler-generated method dispatcher path did not match its callable type");
             };
             out[i] = try self.synthesizeComponentEvidence(view, param.method, component_ty);
         }
@@ -18065,22 +18168,28 @@ const BodyContext = struct {
         component_ty: Type.TypeId,
     ) Allocator.Error!SpecEvidence {
         if (methodOwnerFromType(&self.builder.program.types, component_ty)) |owner| {
-            if (self.builder.lookupMethodTarget(owner, view, method)) |found| {
-                const arena = self.builder.evidence_arena.allocator();
-                const target = try arena.create(SpecEvidenceTarget);
-                target.* = .{ .view = found.view, .target = found.target, .nested = .synthesize };
-                return .{ .target = target };
-            }
+            const found = self.builder.lookupMethodTarget(owner, view, method) orelse
+                Common.invariant("compiler-generated component owner had no exact checked method target");
+            const arena = self.builder.evidence_arena.allocator();
+            const target = try arena.create(SpecEvidenceTarget);
+            target.* = .{
+                .view = found.view,
+                .target = found.target,
+                .instantiation = null,
+                .nested = .synthesize,
+            };
+            return .{ .target = target };
         }
         if (structuralKindForMethodText(view.names.methodNameText(method))) |kind| {
             return .{ .structural = kind };
         }
-        return .unreachable_value;
+        if (self.typeIsClosedEmptyTagUnion(component_ty)) return .unreachable_value;
+        Common.invariant("compiler-generated ownerless component had no checked structural or uninhabited evidence");
     }
 
     /// Walk a checked dispatcher path over a concrete monomorphic type.
-    /// Null when the mono shape diverges from the checked scheme's (e.g. an
-    /// erased row) — the requirement then stays a counted gap.
+    /// Null when the mono shape diverges from the checked scheme; callers treat
+    /// that as an invariant because checked dispatcher paths are exact.
     fn walkEvidencePath(
         self: *BodyContext,
         view: ModuleView,
@@ -23388,34 +23497,34 @@ const BodyContext = struct {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
         const lookup: MethodLookup = blk: {
-            // Consume the checked (or edge-supplied) resolution; owner
-            // owner derivation still covers migration leftovers and its comparison
-            // audit.
+            // Consume the checked or edge-supplied resolution.
             switch (plan.resolution) {
                 .direct => |node_id| {
-                    const consumed = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target);
-                    if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
+                    const node = self.view.static_dispatch_plans.evidenceNode(node_id);
+                    var consumed = self.methodLookupForResolvedTarget(node.target);
+                    consumed.instantiation = switch (node.instantiation) {
+                        .monomorphic => null,
+                        .callable => |callable_ty| .{ .view = self.view, .callable_ty = callable_ty },
+                    };
                     break :blk consumed;
                 },
                 .constraint => |constraint_ref| {
                     if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
                         .target => |target| {
-                            const consumed: MethodLookup = .{ .view = target.view, .target = target.target };
-                            if (@import("builtin").mode == .Debug) self.debugCompareIteratorDerivation(dispatcher_ty, plan.method, consumed);
+                            const consumed: MethodLookup = .{
+                                .view = target.view,
+                                .target = target.target,
+                                .instantiation = target.instantiation,
+                            };
                             break :blk consumed;
                         },
                         .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
-                        .unavailable => self.builder.evidenceGap("iterator-entry-unavailable", self.view.names.methodNameText(plan.method)),
                     } else {
-                        self.builder.evidenceGap("iterator-chain-miss", self.view.names.methodNameText(plan.method));
+                        Common.invariant("iterator method evidence was absent from its lexical chain");
                     }
                 },
                 .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
             }
-            const owner = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) orelse
-                Common.invariant("iterator dispatch plan had no method owner");
-            break :blk self.builder.lookupMethodTarget(owner, self.view, plan.method) orelse
-                Common.invariant("checked iterator dispatch method registry is missing resolved target");
         };
 
         const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
@@ -24689,6 +24798,62 @@ test "monotype sameType keeps failed alias alternatives out of recursion stack" 
     try std.testing.expect(!ctx.sameType(alias_str, alias_i64));
 }
 
+test "specialization evidence equality includes exact target instantiation" {
+    var target_view: ModuleView = undefined;
+    target_view.key = .{};
+    target_view.key.bytes[0] = 1;
+    var other_target_view: ModuleView = undefined;
+    other_target_view.key = .{};
+    other_target_view.key.bytes[0] = 2;
+    var instantiation_view: ModuleView = undefined;
+    instantiation_view.key = .{};
+    instantiation_view.key.bytes[0] = 3;
+    var other_instantiation_view: ModuleView = undefined;
+    other_instantiation_view.key = .{};
+    other_instantiation_view.key.bytes[0] = 4;
+
+    const method: static_dispatch.MethodTarget = .{
+        .module_idx = 5,
+        .def_idx = @enumFromInt(6),
+        .kind = .generated_structural_encoder,
+        .callable_ty = @enumFromInt(7),
+    };
+    const exact: SpecEvidenceTarget = .{
+        .view = target_view,
+        .target = method,
+        .instantiation = .{ .view = instantiation_view, .callable_ty = @enumFromInt(8) },
+        .nested = .{ .resolved = &.{.{ .structural = .equality }} },
+    };
+    try std.testing.expect(specEvidenceEql(.{ .target = &exact }, .{ .target = &exact }));
+
+    var different_target_view = exact;
+    different_target_view.view = other_target_view;
+    try std.testing.expect(!specEvidenceEql(.{ .target = &exact }, .{ .target = &different_target_view }));
+
+    var different_instantiation_view = exact;
+    different_instantiation_view.instantiation.?.view = other_instantiation_view;
+    try std.testing.expect(!specEvidenceEql(.{ .target = &exact }, .{ .target = &different_instantiation_view }));
+
+    var different_callable = exact;
+    different_callable.instantiation.?.callable_ty = @enumFromInt(9);
+    try std.testing.expect(!specEvidenceEql(.{ .target = &exact }, .{ .target = &different_callable }));
+
+    var unresolved_nested = exact;
+    unresolved_nested.nested = .synthesize;
+    try std.testing.expect(!specEvidenceEql(.{ .target = &exact }, .{ .target = &unresolved_nested }));
+
+    var monomorphic = exact;
+    monomorphic.instantiation = null;
+    var monomorphic_other_view = monomorphic;
+    monomorphic_other_view.view = other_target_view;
+    monomorphic_other_view.target = method;
+    try std.testing.expect(!specEvidenceEql(.{ .target = &monomorphic }, .{ .target = &monomorphic_other_view }));
+
+    var monomorphic_other_caller = monomorphic;
+    monomorphic_other_caller.instantiation = null;
+    try std.testing.expect(specEvidenceEql(.{ .target = &monomorphic }, .{ .target = &monomorphic_other_caller }));
+}
+
 /// Structural `is_eq` specifics for the generic derivation driver
 /// (`BodyContext.lowerDerivation`). Equality threads two operands, builds a
 /// component access on each, and conjoins the per-component bools with AND so
@@ -25315,6 +25480,19 @@ fn ownerTemplateForConstFnDef(fn_def: anytype) names.ProcTemplate {
     return switch (fn_def) {
         .nested => |nested| nested.owner,
         else => Common.invariant("capturing stored function must have a nested owner template"),
+    };
+}
+
+fn templateForConstFnDef(fn_def: check.ConstStore.FnDef) names.ProcTemplate {
+    return switch (fn_def) {
+        .local_template,
+        .imported_template,
+        .local_hosted,
+        .imported_hosted,
+        .checked_generated,
+        => |template| template,
+        .nested => |nested| nested.owner,
+        .parser_runtime, .encoder_for_runtime => Common.invariant("generated runtime function has no checked evidence template"),
     };
 }
 

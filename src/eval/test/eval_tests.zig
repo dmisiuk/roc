@@ -380,6 +380,36 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "42.0" },
     },
     .{
+        .name = "inspect: noncapturing compile-time callable restores dispatch evidence",
+        .source_kind = .module,
+        .source =
+        \\make_same = |_| |x| x == x
+        \\
+        \\same = make_same({})
+        \\
+        \\main = same({ value: 42 })
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "inspect: noncapturing compile-time callable restores attached-method target",
+        .source_kind = .module,
+        .source =
+        \\Container(a) := [Value(a)].{
+        \\    add1 = |container| container.map(|value| value + 1.I64)
+        \\
+        \\    map : Container(a), (a -> b) -> Container(b)
+        \\    map = |Value(value), transform| Value(transform(value))
+        \\}
+        \\
+        \\make_increment = |_| |container| container.add1()
+        \\increment = make_increment({})
+        \\
+        \\main = increment(Container.Value(41.I64))
+        ,
+        .expected = .{ .inspect_str = "Value(42)" },
+    },
+    .{
         .name = "inspect: numeric default specialization remains replaceable until constrained",
         .source_kind = .module,
         .source =

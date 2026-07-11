@@ -1657,6 +1657,8 @@ const Lowerer = struct {
         errdefer {
             for (variants[0..initialized]) |variant| {
                 if (variant.captures.len > 0) self.allocator.free(variant.captures);
+                if (variant.template.evidence.len > 0) self.allocator.free(variant.template.evidence);
+                if (variant.template.evidence_frame_root_counts.len > 0) self.allocator.free(variant.template.evidence_frame_root_counts);
             }
             self.allocator.free(variants);
         }
@@ -1678,7 +1680,7 @@ const Lowerer = struct {
                     try self.callablePayloadLayout(value_layout, type_variants.len, @intCast(index), capture_ty)
                 else
                     .zst,
-                .template = constFnTemplateFromMono(self.fnTemplateForFn(variant.target)),
+                .template = try constFnTemplateFromMono(self, self.fnTemplateForFn(variant.target)),
                 .captures = captures,
             };
             captures_owned = false;
@@ -1704,6 +1706,8 @@ const Lowerer = struct {
         errdefer {
             for (entries[0..initialized]) |entry| {
                 if (entry.captures.len > 0) self.allocator.free(entry.captures);
+                if (entry.template.evidence.len > 0) self.allocator.free(entry.template.evidence);
+                if (entry.template.evidence_frame_root_counts.len > 0) self.allocator.free(entry.template.evidence_frame_root_counts);
             }
             self.allocator.free(entries);
         }
@@ -1720,7 +1724,7 @@ const Lowerer = struct {
             entries[index] = .{
                 .entry = try self.markReachableFn(member.target),
                 .capture_layout = if (member.capture_ty) |capture_ty| try self.layoutOfType(capture_ty) else .zst,
-                .template = constFnTemplateFromMono(self.fnTemplateForFn(member.target)),
+                .template = try constFnTemplateFromMono(self, self.fnTemplateForFn(member.target)),
                 .captures = captures,
             };
             captures_owned = false;
@@ -7371,12 +7375,20 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         source_files.appendAssumeCapacity(try allocator.dupe(u8, file));
     }
 
+    var const_fn_evidence = try clonedLiftedProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence", allocator, view.const_fn_evidence);
+    errdefer const_fn_evidence.deinit(allocator);
+
+    var const_fn_evidence_frame_root_counts = try clonedLiftedProgramList(u32, "const_fn_evidence_frame_root_counts", allocator, view.const_fn_evidence_frame_root_counts);
+    errdefer const_fn_evidence_frame_root_counts.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .names = name_store,
         .next_symbol = program.next_symbol,
         .types = types,
         .imported_fns = try clonedLiftedProgramList(Lifted.ImportedFn, "imported_fns", allocator, view.imported_fns),
+        .const_fn_evidence = const_fn_evidence,
+        .const_fn_evidence_frame_root_counts = const_fn_evidence_frame_root_counts,
         .fns = try clonedLiftedProgramList(Lifted.Fn, "fns", allocator, view.fns),
         .exprs = try clonedLiftedProgramList(Lifted.Expr, "exprs", allocator, view.exprs),
         .pats = try clonedLiftedProgramList(Lifted.Pat, "pats", allocator, view.pats),
@@ -7590,11 +7602,17 @@ fn lirSymbol(symbol: Common.Symbol) LIR.Symbol {
     return LIR.Symbol.fromRaw(@intCast(@intFromEnum(symbol)));
 }
 
-fn constFnTemplateFromMono(template: Mono.FnTemplate) LirProgram.FnTemplate {
+fn constFnTemplateFromMono(self: *Lowerer, template: Mono.FnTemplate) std.mem.Allocator.Error!LirProgram.FnTemplate {
+    const lifted = self.solved.lifted.view();
+    const evidence = try self.allocator.dupe(check.ConstStore.ConstFnEvidence, lifted.const_fn_evidence[template.const_evidence.start..][0..template.const_evidence.len]);
+    errdefer self.allocator.free(evidence);
+    const frame_root_counts = try self.allocator.dupe(u32, lifted.const_fn_evidence_frame_root_counts[template.const_evidence_frame_root_counts.start..][0..template.const_evidence_frame_root_counts.len]);
     return .{
         .fn_def = constFnDefFromMono(template.fn_def),
         .source_fn_ty = template.source_fn_ty,
         .source_fn_key = template.source_fn_key,
+        .evidence = evidence,
+        .evidence_frame_root_counts = frame_root_counts,
     };
 }
 
@@ -7626,6 +7644,8 @@ fn emptySolvedProgramForTest(allocator: std.mem.Allocator) Solved.Program {
         allocator,
         NameStore.init(allocator),
         MonoType.Store.init(allocator),
+        .empty,
+        .empty,
         .empty,
         .empty,
         .empty,
