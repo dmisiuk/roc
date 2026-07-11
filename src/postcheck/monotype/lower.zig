@@ -345,6 +345,13 @@ const LocalProcContext = struct {
 const LoweredTemplate = struct {
     def: Ast.DefId,
     spec: Ast.SpecId,
+    /// The graph whose deferred entry owns a reserved/lowering body. The
+    /// pointer is inspected only while that synchronous graph is alive.
+    owner_graph: ?*InstGraph = null,
+    /// A second graph consumed this callable while its body was lowering. In
+    /// that case the request interface must remain structurally immutable:
+    /// the second graph cannot receive later union-find refinement.
+    cross_graph_lowering_hit: bool = false,
     /// Evidence for the template scheme's dispatch requirements, in enumeration
     /// evidence-param order, supplied by the first requesting edge. Reused
     /// specializations debug-assert later edges agree (evidence is a function
@@ -383,7 +390,7 @@ const FinalBodyOutputCounts = struct {
 
 const ReservedTemplate = struct {
     target: Ast.FnSlot,
-    needs_lowering: bool,
+    needs_enqueue: bool,
 
     fn localFnId(self: ReservedTemplate) Ast.FnId {
         return localFnIdFromSlot(self.target, "Monotype procedure template reservation needed a local function id");
@@ -403,6 +410,7 @@ const NestedFnRequest = struct {
     ctx: *BodyContext,
     expr_id: checked.CheckedExprId,
     fn_template: Ast.FnTemplate,
+    owns_evidence_scope: bool,
 };
 
 const LambdaArgLet = struct {
@@ -430,6 +438,7 @@ const LoweredCall = struct {
 const LoweringDemand = enum {
     runtime_value,
     inspect_only,
+    uninhabited_result,
 };
 
 const ParseIntrinsic = enum {
@@ -1516,6 +1525,9 @@ const Builder = struct {
 
         const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
+        const lowering_entry = self.lowered_templates.getPtr(reservation.fn_id) orelse
+            Common.invariant("procedure specialization lost its lowering state before graph creation");
+        lowering_entry.owner_graph = graph;
         const saved_graph = self.active_graph;
         self.active_graph = graph;
         defer self.active_graph = saved_graph;
@@ -1545,9 +1557,6 @@ const Builder = struct {
         lowered_template.evidence = body_ctx.evidence.vector;
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
-        const root_fn_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
-        body_ctx.owner_context_fn_key = root_fn_key;
-        body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
@@ -1563,9 +1572,15 @@ const Builder = struct {
         if (!body_uses_generated_evidence) {
             try graph.addMonoView(root_node, lower_fn_ty);
         }
+        try body_ctx.instantiateTemplateDispatchRelations(template, null);
         const draft = FinalBodyOutputGuard.begin(self);
         const live_fn_ty = try body_ctx.activeTypeFromNode(root_node);
         const body_fn_ty = if (body_uses_generated_evidence) lower_fn_ty else live_fn_ty;
+        var relation_refined_fn_template = fn_template;
+        relation_refined_fn_template.mono_fn_ty = body_fn_ty;
+        const root_fn_key = Ast.fnTemplateDigest(relation_refined_fn_template, &self.program.types, &self.program.names);
+        body_ctx.owner_context_fn_key = root_fn_key;
+        body_ctx.current_fn_key = root_fn_key;
         const lowered = try body_ctx.lowerTemplateBody(template_ref, template, body_fn_ty);
         const draft_end = draft.end(self);
         try self.drainSpecRequests(graph);
@@ -1632,15 +1647,23 @@ const Builder = struct {
             self.count("template_hits");
             switch (found) {
                 .local => |hit| {
-                    const existing = self.lowered_templates.get(hit.fn_id) orelse
+                    const existing = self.lowered_templates.getPtr(hit.fn_id) orelse
                         Common.invariant("Monotype specialization index found a local template missing from lowering state");
                     if (!specEvidenceVectorEql(existing.evidence, evidence)) {
                         Common.invariant("specialization edges disagreed on dispatch evidence");
                     }
+                    if (hit.status == .lowering and existing.owner_graph != requester) {
+                        existing.cross_graph_lowering_hit = true;
+                    }
                     try self.unifyRequestWithLocalHit(requester, fn_ty, hit);
                     return .{
                         .target = .{ .local = hit.fn_id },
-                        .needs_lowering = hit.status == .reserved,
+                        // Every graph that observes a reserved record keeps a
+                        // deferred entry as its explicit completion waiter.
+                        // Repeated entries in the owning graph share live
+                        // union-find state; entries in another graph receive
+                        // the solved type when that graph later drains.
+                        .needs_enqueue = hit.status == .reserved,
                     };
                 },
                 // A loaded record only matches at its solved shape, so the
@@ -1648,7 +1671,7 @@ const Builder = struct {
                 // and no solved-evidence unification is needed.
                 .loaded => |imported| return .{
                     .target = .{ .imported = imported },
-                    .needs_lowering = false,
+                    .needs_enqueue = false,
                 },
             }
         }
@@ -1672,10 +1695,11 @@ const Builder = struct {
             .def = def_id,
             .spec = spec,
             .evidence = evidence,
+            .owner_graph = requester,
         });
         return .{
             .target = .{ .local = fn_id },
-            .needs_lowering = true,
+            .needs_enqueue = true,
         };
     }
 
@@ -1700,6 +1724,12 @@ const Builder = struct {
     fn markTemplateReady(self: *Builder, fn_id: Ast.FnId, fn_ty: Type.TypeId) Allocator.Error!void {
         const entry = self.lowered_templates.get(fn_id) orelse
             Common.invariant("lowered procedure template definition disappeared before completion");
+        if (entry.cross_graph_lowering_hit) {
+            const record = self.program.getSpec(entry.spec);
+            if (!try self.program.types.typeEql(&self.program.names, record.request_fn_ty, fn_ty)) {
+                Common.invariant("cross-graph specialization consumer observed a callable interface refined during lowering");
+            }
+        }
         try self.spec_store.markReady(entry.spec, fn_ty, self.specializationTypeDigest(fn_ty));
     }
 
@@ -2204,6 +2234,11 @@ const Builder = struct {
         return sealed;
     }
 
+    fn specializationRequesterNode(graph: *InstGraph, fn_ty: Type.TypeId) Allocator.Error!NodeId {
+        if (graph.monoViewNode(fn_ty)) |node| return node;
+        return try graph.importMono(fn_ty);
+    }
+
     fn functionShape(self: *Builder, ty: Type.TypeId, comptime message: []const u8) FunctionShape {
         return switch (self.shapeContent(ty)) {
             .func => |func| .{ .args = func.args, .ret = func.ret },
@@ -2697,7 +2732,7 @@ const Builder = struct {
         // body sections before the active draft has sealed.
         if (self.active_graph) |graph| {
             var request_template = fn_template;
-            const requester_fn_node = try graph.importMono(request_template.mono_fn_ty);
+            const requester_fn_node = try specializationRequesterNode(graph, request_template.mono_fn_ty);
             request_template.mono_fn_ty = try self.stableSpecializationRequestType(graph, fn_template.mono_fn_ty);
             const reserved = try self.reserveTemplateWithMonoFor(
                 template_ref,
@@ -2707,7 +2742,7 @@ const Builder = struct {
                 evidence,
                 graph,
             );
-            if (reserved.needs_lowering) {
+            if (reserved.needs_enqueue) {
                 try self.pinDeferredTemplateRequestToCheckedRoot(graph, template_ref, request_template.mono_fn_ty);
                 try graph.deferred_templates.append(self.allocator, .{
                     .fn_id = reserved.localFnId(),
@@ -2803,7 +2838,7 @@ const Builder = struct {
             .nested => Common.invariant("nested function specialization must be lowered through nested function lowering"),
         };
         var request_template = fn_template;
-        const requester_fn_node = try source_ctx.graph.importMono(request_template.mono_fn_ty);
+        const requester_fn_node = try specializationRequesterNode(source_ctx.graph, request_template.mono_fn_ty);
         request_template.mono_fn_ty = try self.stableSpecializationRequestType(source_ctx.graph, fn_template.mono_fn_ty);
         const reserved = try self.reserveTemplateWithMonoFor(
             template_ref,
@@ -2813,7 +2848,7 @@ const Builder = struct {
             evidence,
             source_ctx.graph,
         );
-        if (reserved.needs_lowering) {
+        if (reserved.needs_enqueue) {
             try self.pinDeferredTemplateRequestToCheckedRoot(source_ctx.graph, template_ref, request_template.mono_fn_ty);
             try source_ctx.graph.deferred_templates.append(self.allocator, .{
                 .fn_id = reserved.localFnId(),
@@ -2911,6 +2946,7 @@ const Builder = struct {
             .ctx = nested_ctx,
             .expr_id = expr_id,
             .fn_template = fn_template,
+            .owns_evidence_scope = nested_evidence != null,
         });
     }
 
@@ -2925,6 +2961,57 @@ const Builder = struct {
             .nested => |nested| nested,
             else => Common.invariant("local procedure specialization did not have a nested function identity"),
         };
+        const root_node = try request.ctx.instNode(fn_template.source_fn_ty);
+        var finalized_scope_fn_ty: ?Type.TypeId = null;
+        const body_uses_generated_evidence = request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
+        if (request.owns_evidence_scope) {
+            const checked_scope_fn_node = try request.ctx.lowerExprTypeNode(request.expr_id);
+            try request.ctx.graph.unify(root_node, checked_scope_fn_node);
+            try request.ctx.graph.drainDirty();
+            try request.ctx.instantiateTemplateDispatchRelations(request.ctx.view.templates.get(request.ctx.owner_template.template), request.expr_id);
+            if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
+                try request.ctx.graph.unify(root_node, request_node);
+                try request.ctx.graph.drainDirty();
+            }
+        }
+        if (body_uses_generated_evidence) {
+            const public_constraint_fn_ty = try request.ctx.publicOpaqueFunctionUnificationType(fn_template.mono_fn_ty);
+            try request.ctx.constrainTypeToMono(fn_template.source_fn_ty, public_constraint_fn_ty);
+        } else {
+            if (request.owns_evidence_scope) {
+                // The complete checked relation set for this lexical scope is
+                // now installed. Finalize only the nested callable interface,
+                // then put that closed result back into the graph before
+                // filling the contextual Monotype view. Body-internal nodes
+                // remain active.
+                const finalized_fn_ty = try request.ctx.graph.sealNode(root_node);
+                finalized_scope_fn_ty = finalized_fn_ty;
+                try request.ctx.graph.unify(root_node, try request.ctx.graph.importMono(finalized_fn_ty));
+                try request.ctx.graph.drainDirty();
+            } else {
+                const public_constraint_fn_ty = try request.ctx.publicOpaqueFunctionUnificationType(fn_template.mono_fn_ty);
+                try request.ctx.constrainTypeToMono(fn_template.source_fn_ty, public_constraint_fn_ty);
+            }
+            if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
+                if (!request.owns_evidence_scope) {
+                    try request.ctx.graph.unify(root_node, request_node);
+                    try request.ctx.graph.drainDirty();
+                }
+                try request.ctx.graph.addMonoView(root_node, fn_template.mono_fn_ty);
+            } else {
+                try request.ctx.graph.addMonoView(root_node, fn_template.mono_fn_ty);
+            }
+        }
+        if (!request.owns_evidence_scope) {
+            try request.ctx.instantiateTemplateDispatchRelations(request.ctx.view.templates.get(request.ctx.owner_template.template), request.expr_id);
+        }
+        const live_fn_ty = try request.ctx.activeTypeFromNode(root_node);
+        const body_fn_ty = if (body_uses_generated_evidence)
+            fn_template.mono_fn_ty
+        else
+            finalized_scope_fn_ty orelse live_fn_ty;
+        fn_template.mono_fn_ty = body_fn_ty;
+        request.ctx.current_fn_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
         self.count("nested_requests");
         const fn_ty_digest = self.specializationTypeDigest(fn_template.mono_fn_ty);
         if (try self.spec_store.findLocal(nestedSpecIdentity(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
@@ -2961,21 +3048,6 @@ const Builder = struct {
         const spec = try self.addNestedSpecRecord(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest, fn_id);
         try self.lowered_nested_by_fn.put(fn_id, spec);
 
-        const public_constraint_fn_ty = try request.ctx.publicOpaqueFunctionUnificationType(fn_template.mono_fn_ty);
-        try request.ctx.constrainTypeToMono(fn_template.source_fn_ty, public_constraint_fn_ty);
-
-        const root_node = try request.ctx.instNode(fn_template.source_fn_ty);
-        const body_uses_generated_evidence = request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
-        if (!body_uses_generated_evidence) {
-            if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
-                try request.ctx.graph.unify(root_node, request_node);
-                try request.ctx.graph.drainDirty();
-            } else {
-                try request.ctx.graph.addMonoView(root_node, fn_template.mono_fn_ty);
-            }
-        }
-        const live_fn_ty = try request.ctx.activeTypeFromNode(root_node);
-        const body_fn_ty = if (body_uses_generated_evidence) fn_template.mono_fn_ty else live_fn_ty;
         const lowered = try request.ctx.lowerNestedFunction(request.expr_id, body_fn_ty);
         var def_template = fn_template;
         def_template.mono_fn_ty = body_fn_ty;
@@ -3012,6 +3084,27 @@ const Builder = struct {
         defer sealer.deinit();
 
         for (graph.deferred_templates.items[start_len..]) |*request| {
+            const entry = self.lowered_templates.get(request.fn_id) orelse
+                Common.invariant("deferred Monotype procedure template request referenced a missing reservation");
+            const record = self.program.getSpec(entry.spec);
+            switch (record.status) {
+                .ready => {
+                    // This queue entry is a waiter from a graph other than the
+                    // one that completed the reservation. Deliver the solved
+                    // callable type to its original request node before this
+                    // graph seals any enclosing value.
+                    try graph.unify(request.requester_fn_node, try graph.importMono(record.solved_fn_ty));
+                    try graph.drainDirty();
+                    continue;
+                },
+                .lowering => {
+                    // Only repeated entries in the graph currently lowering
+                    // this reservation can be observed synchronously. Their
+                    // request nodes already share that graph's live class.
+                    continue;
+                },
+                .reserved => {},
+            }
             const sealed_fn_ty = try sealer.sealType(request.fn_ty);
             if (sealed_fn_ty == request.fn_ty) continue;
             request.fn_ty = sealed_fn_ty;
@@ -6520,6 +6613,11 @@ const BodyContext = struct {
     /// on the branch comparing the bound value against the literal's
     /// `from_numeral`-converted constant.
     pattern_literal_guards: std.ArrayList(PatternLiteralGuard),
+    /// Match lowering can pre-register binder locals with graph type cells so
+    /// branch bodies contribute constraints before the scrutinee is sealed.
+    /// The subsequent pattern pass must attach those exact locals to the
+    /// emitted patterns instead of allocating replacements.
+    reuse_pre_registered_pattern_binders: bool = false,
     /// Structural equality types currently being expanded in this context.
     /// Seeing the same type again is a real recursive edge, which lowers to a
     /// reserved generated equality helper instead of recursively expanding AST.
@@ -8435,6 +8533,32 @@ const BodyContext = struct {
         }
     }
 
+    fn instantiateTemplateDispatchRelations(
+        self: *BodyContext,
+        template: checked.CheckedProcedureTemplate,
+        scope_expr: ?checked.CheckedExprId,
+    ) Allocator.Error!void {
+        const span = template.static_dispatch_plans;
+        const refs = self.view.static_dispatch_plans.template_refs[span.start .. span.start + span.len];
+        const scopes = self.view.templates.dispatch_ref_scopes[span.start .. span.start + span.len];
+        const kinds = self.view.templates.dispatch_relation_kinds[span.start .. span.start + span.len];
+        if (refs.len != scopes.len or refs.len != kinds.len) Common.invariant("checked template dispatch refs and relation metadata differed in length");
+        for (refs, scopes, kinds) |plan_id, scope_id, relation_kind| {
+            if (scope_expr) |expr_id| {
+                if (scope_id == std.math.maxInt(u32)) continue;
+                const scope = self.view.templates.dispatch_scopes[scope_id];
+                if (scope.checked_expr != expr_id) continue;
+            } else if (scope_id != std.math.maxInt(u32)) {
+                continue;
+            }
+            if (relation_kind == .conversion) continue;
+            const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
+            const expr_ty = self.view.bodies.expr(plan.expr).ty;
+            _ = try self.dispatchResultTypeNode(expr_ty, plan_id, null);
+        }
+        try self.graph.drainDirty();
+    }
+
     fn lowerStrInspectIntrinsic(self: *BodyContext, fn_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!LoweredTemplateBody {
         const fn_data = self.builder.functionShape(fn_ty, "Str.inspect intrinsic had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
@@ -8486,6 +8610,25 @@ const BodyContext = struct {
         const exhaustiveness_scope = self.comptime_exhaustiveness_context.resetForRuntimeFunction();
         defer exhaustiveness_scope.leave();
 
+        for (arg_tys, 0..) |arg_ty, uninhabited_index| {
+            if (!try self.typeIsProvenUninhabited(arg_ty)) continue;
+            const args = try self.allocator.alloc(BodyTypedLocal, checked_args.len);
+            defer self.allocator.free(args);
+            for (arg_tys, 0..) |ty, index| {
+                args[index] = .{ .local = try self.addLocal(self.builder.symbols.fresh(), ty), .ty = ty };
+            }
+            const scrutinee = try self.localExpr(args[uninhabited_index].local, arg_ty);
+            const body = try self.addExpr(.{ .ty = ret_ty, .data = .{ .match_ = .{
+                .scrutinee = scrutinee,
+                .branches = try self.addBranchSpan(&.{}),
+            } } });
+            return .{
+                .args = try self.addTypedLocalSpan(args),
+                .body = body,
+                .ret = try self.draftTypeCell(ret_ty),
+            };
+        }
+
         const args = try self.allocator.alloc(BodyTypedLocal, checked_args.len);
         defer self.allocator.free(args);
         var arg_lets = std.ArrayList(LambdaArgLet).empty;
@@ -8520,11 +8663,14 @@ const BodyContext = struct {
             }
         }
 
-        var body = try self.lowerBindingContinuation(.{ .materialized_args = .{
-            .args = materialized_args.items,
-            .index = 0,
-            .body = checked_body,
-        } }, ret_ty);
+        var body = if (try self.typeIsProvenUninhabited(ret_ty))
+            try self.lowerExplicitUninhabitedInvocation(checked_body, ret_ty)
+        else
+            try self.lowerBindingContinuation(.{ .materialized_args = .{
+                .args = materialized_args.items,
+                .index = 0,
+                .body = checked_body,
+            } }, ret_ty);
         const body_loc = self.exprLoc(body);
         const body_region_after_lowering = self.exprRegion(body);
         const saved_body_loc = self.builder.program.current_loc;
@@ -8545,8 +8691,10 @@ const BodyContext = struct {
             } } });
         }
 
-        const body_ty = try self.exprType(body);
-        try self.graph.unify(try self.graph.importMono(ret_ty), try self.graph.importMono(body_ty));
+        try self.graph.unify(
+            try self.activeNodeFromType(ret_ty),
+            try self.exprTypeCell(body).toGraphNode(self.graph),
+        );
         try self.graph.drainDirty();
         const solved_ret_ty = try self.activeTypeFromType(ret_ty);
         self.draft.exprs.items[@intFromEnum(body)].ty = try self.draftTypeCell(solved_ret_ty);
@@ -8588,26 +8736,11 @@ const BodyContext = struct {
     fn lowerExprTypeNode(self: *BodyContext, expr_id: checked.CheckedExprId) Allocator.Error!NodeId {
         const expr = self.view.bodies.expr(expr_id);
         return switch (expr.data) {
-            .call => |call| if (try self.callResultMonoType(expr.ty, call, null)) |ty|
-                try self.activeNodeFromType(ty)
-            else
-                try self.lowerTypeNode(expr.ty),
-            .dispatch_call => |plan| if (try self.dispatchResultMonoType(expr.ty, plan, null)) |ty|
-                try self.activeNodeFromType(ty)
-            else
-                try self.lowerTypeNode(expr.ty),
-            .interpolation => |interpolation| if (try self.dispatchResultMonoType(expr.ty, interpolation.plan, null)) |ty|
-                try self.activeNodeFromType(ty)
-            else
-                try self.lowerTypeNode(expr.ty),
-            .type_dispatch_call => |plan| if (try self.dispatchResultMonoType(expr.ty, plan, null)) |ty|
-                try self.activeNodeFromType(ty)
-            else
-                try self.lowerTypeNode(expr.ty),
-            .method_eq => |plan| if (try self.dispatchResultMonoType(expr.ty, plan, null)) |ty|
-                try self.activeNodeFromType(ty)
-            else
-                try self.lowerTypeNode(expr.ty),
+            .call => |call| try self.callResultTypeNode(expr.ty, call, null),
+            .dispatch_call => |plan| try self.dispatchResultTypeNode(expr.ty, plan, null),
+            .interpolation => |interpolation| try self.dispatchResultTypeNode(expr.ty, interpolation.plan, null),
+            .type_dispatch_call => |plan| try self.dispatchResultTypeNode(expr.ty, plan, null),
+            .method_eq => |plan| try self.dispatchResultTypeNode(expr.ty, plan, null),
             .lookup_local => |lookup| try self.activeNodeFromType(try self.lookupExprMonoType(expr.ty, lookup.resolved)),
             .lookup_external => |resolved| try self.activeNodeFromType(try self.lookupExprMonoType(expr.ty, resolved)),
             .lookup_required => |resolved| try self.activeNodeFromType(try self.lookupExprMonoType(expr.ty, resolved)),
@@ -8670,9 +8803,9 @@ const BodyContext = struct {
             .call => |call| if (try self.lowerInspectOnlyCall(expr.ty, call, try self.builder.primitiveType(.str))) |rendered| return rendered,
             else => {},
         }
-        self.requireLowerableNode(expr, try self.lowerExprTypeNode(expr_id), .runtime_value);
         switch (expr.data) {
             .call => |call| {
+                self.requireLowerableNode(expr, try self.lowerExprTypeNode(expr_id), .runtime_value);
                 if (self.view.hoisted_constants.lookupByExpr(expr_id) != null) {
                     const expr_ty = try self.lowerExprType(expr_id);
                     if (try self.restoredHoistedExprAtType(expr_id, expr_ty)) |restored| return restored;
@@ -8681,6 +8814,94 @@ const BodyContext = struct {
             },
             else => {},
         }
+        switch (expr.data) {
+            // A literal conversion is the leaf that resolves its checked
+            // variable. Seal that leaf at the point its runtime value is
+            // demanded; enclosing constructors must wait for it rather than
+            // requesting an active view of their still-unresolved payload.
+            .numeral, .str_from_quote => {
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                return try self.lowerExprWithType(expr_id, expr_ty);
+            },
+            // Constructor payloads carry the type evidence that completes the
+            // constructor node. Lower them first, then seal the whole value at
+            // this expression boundary. This is especially important for
+            // nominal open rows such as `Try.Ok(numeral)`.
+            .tag => |tag| {
+                const name = try self.builder.tagName(self.view, tag.name);
+                const payloads = try self.lowerConstructorChildSpan(tag.args);
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                return try self.addConstructorExpr(expr_ty, .{ .tag = .{
+                    .name = name,
+                    .payloads = payloads,
+                } });
+            },
+            .zero_argument_tag => |tag| {
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                return try self.addConstructorExpr(expr_ty, .{ .tag = .{
+                    .name = try self.builder.tagName(self.view, tag.name),
+                    .payloads = .empty(),
+                } });
+            },
+            .nominal => |nominal| {
+                const backing = try self.lowerConstructorChild(nominal.backing_expr);
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                const backing_ty = if (self.builder.nominalConstructionLayer(expr_ty)) |layer|
+                    layer.backing
+                else
+                    self.builder.namedBackingType(expr_ty) orelse expr_ty;
+                if (!self.sameType(backing_ty, try self.exprType(backing))) {
+                    Common.invariant("nominal constructor backing lowered at a type different from its named layer");
+                }
+                return try self.addExpr(.{ .ty = expr_ty, .data = .{ .nominal = backing } });
+            },
+            .tuple => |items| {
+                const lowered = try self.lowerConstructorChildSpan(items);
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                const item_tys = self.builder.tupleItemTypes(expr_ty);
+                if (items.len != GuardedList.borrowLen(item_tys)) {
+                    Common.invariant("tuple constructor arity differed from its finalized type");
+                }
+                for (0..items.len) |index| {
+                    if (!self.sameType(GuardedList.at(item_tys, index), try self.exprType(self.exprSpan(lowered)[index]))) {
+                        Common.invariant("tuple constructor child lowered at a type different from its finalized item type");
+                    }
+                }
+                return try self.addConstructorExpr(expr_ty, .{ .tuple = lowered });
+            },
+            .list => |items| {
+                const lowered = try self.lowerConstructorChildSpan(items);
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                const elem_ty = switch (self.builder.shapeContent(expr_ty)) {
+                    .list => |elem| elem,
+                    else => Common.invariant("list constructor finalized at a non-list type"),
+                };
+                for (self.exprSpan(lowered)) |item| {
+                    if (!self.sameType(elem_ty, try self.exprType(item))) {
+                        Common.invariant("list constructor child lowered at a type different from its finalized element type");
+                    }
+                }
+                return try self.addExpr(.{ .ty = expr_ty, .data = .{ .list = lowered } });
+            },
+            .record => |record| {
+                var children = std.ArrayList(PreLoweredChild).empty;
+                defer children.deinit(self.allocator);
+                if (record.ext) |ext| {
+                    try children.append(self.allocator, .{ .checked_expr = ext, .expr = try self.lowerConstructorChild(ext) });
+                }
+                for (record.fields) |field| {
+                    try children.append(self.allocator, .{ .checked_expr = field.value, .expr = try self.lowerConstructorChild(field.value) });
+                }
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                return try self.lowerRecordExpr(record, expr_ty, children.items);
+            },
+            .empty_list, .empty_record => {
+                const expr_ty = try self.sealTypeNode(try self.lowerExprTypeNode(expr_id));
+                return try self.lowerExprWithType(expr_id, expr_ty);
+            },
+            else => {},
+        }
+        self.requireLowerableNode(expr, try self.lowerExprTypeNode(expr_id), .runtime_value);
         const expr_ty = try self.lowerExprType(expr_id);
         if (try self.restoredHoistedExprAtType(expr_id, expr_ty)) |restored| return restored;
         switch (expr.data) {
@@ -8854,7 +9075,7 @@ const BodyContext = struct {
             .lookup_required => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty),
             .list => |items| .{ .list = try self.lowerListExpr(items, ty) },
             .tuple => |items| return try self.addConstructorExpr(ty, .{ .tuple = try self.lowerExprSpanAtTypes(items, self.builder.tupleItemTypes(ty)) }),
-            .record => |record| return try self.lowerRecordExpr(record, ty),
+            .record => |record| return try self.lowerRecordExpr(record, ty, &.{}),
             .tag => |tag| {
                 const name = try self.builder.tagName(self.view, tag.name);
                 return try self.addConstructorExpr(ty, .{ .tag = .{
@@ -8865,9 +9086,18 @@ const BodyContext = struct {
             .zero_argument_tag => |tag| return try self.addConstructorExpr(ty, .{ .tag = .{ .name = try self.builder.tagName(self.view, tag.name), .payloads = .empty() } }),
             .nominal => |nominal| {
                 if (self.builder.nominalConstructionLayer(ty)) |layer| {
-                    return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, layer.backing) } });
+                    const backing = if (try self.typeIsProvenUninhabited(layer.backing))
+                        try self.lowerExplicitUninhabitedInvocation(nominal.backing_expr, layer.backing)
+                    else
+                        try self.lowerExprAtType(nominal.backing_expr, layer.backing);
+                    return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing } });
                 }
-                return try self.addExpr(.{ .ty = ty, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, self.builder.namedBackingType(ty) orelse ty) } });
+                const backing_ty = self.builder.namedBackingType(ty) orelse ty;
+                const backing = if (try self.typeIsProvenUninhabited(backing_ty))
+                    try self.lowerExplicitUninhabitedInvocation(nominal.backing_expr, backing_ty)
+                else
+                    try self.lowerExprAtType(nominal.backing_expr, backing_ty);
+                return try self.addExpr(.{ .ty = ty, .data = .{ .nominal = backing } });
             },
             .closure => |closure| try self.lowerClosure(expr_id, closure, ty),
             .lambda => blk: {
@@ -8937,7 +9167,7 @@ const BodyContext = struct {
         node: NodeId,
         demand: LoweringDemand,
     ) void {
-        if (demand == .inspect_only) return;
+        if (demand != .runtime_value) return;
         if (!self.nodeIsClosedEmptyTagUnion(node)) return;
         switch (expr.data) {
             .runtime_error, .crash, .ellipsis => {},
@@ -8951,11 +9181,139 @@ const BodyContext = struct {
         while (remaining > 0) : (remaining -= 1) {
             switch (self.graph.content(current)) {
                 .empty_tag_union => return true,
-                .named => |named| current = (named.backing orelse return false).node,
+                .named => |named| {
+                    const backing = named.backing orelse return false;
+                    if (backing.use != .inspectable) return false;
+                    current = backing.node;
+                },
                 else => return false,
             }
         }
         Common.invariant("named Monotype backing cycle reached runtime-value constructibility check");
+    }
+
+    fn nodeIsProvenUninhabited(self: *BodyContext, node: NodeId) Allocator.Error!bool {
+        var visiting = std.AutoHashMap(NodeId, void).init(self.allocator);
+        defer visiting.deinit();
+        return self.nodeIsProvenUninhabitedInner(node, &visiting);
+    }
+
+    fn nodeIsProvenUninhabitedInner(
+        self: *BodyContext,
+        node: NodeId,
+        visiting: *std.AutoHashMap(NodeId, void),
+    ) Allocator.Error!bool {
+        const root = node;
+        const entry = try visiting.getOrPut(root);
+        if (entry.found_existing) return false;
+        defer _ = visiting.remove(root);
+
+        return switch (self.graph.content(root)) {
+            .redirect => |target| self.nodeIsProvenUninhabitedInner(target, visiting),
+            .empty_tag_union => true,
+            .named => |named| if (named.backing) |backing|
+                if (backing.use == .inspectable)
+                    self.nodeIsProvenUninhabitedInner(backing.node, visiting)
+                else
+                    false
+            else
+                false,
+            .box => |payload| self.nodeIsProvenUninhabitedInner(payload, visiting),
+            .tuple => |elems| blk: {
+                for (elems) |elem| {
+                    if (try self.nodeIsProvenUninhabitedInner(elem, visiting)) break :blk true;
+                }
+                break :blk false;
+            },
+            .record => |record| blk: {
+                for (record.fields) |field| {
+                    if (try self.nodeIsProvenUninhabitedInner(field.ty, visiting)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tag_union => |tag_union| blk: {
+                if (!try self.nodeIsProvenUninhabitedInner(tag_union.ext, visiting)) break :blk false;
+                for (tag_union.tags) |tag| {
+                    var tag_is_inhabited = true;
+                    for (tag.payloads) |payload| {
+                        if (try self.nodeIsProvenUninhabitedInner(payload, visiting)) {
+                            tag_is_inhabited = false;
+                            break;
+                        }
+                    }
+                    if (tag_is_inhabited) break :blk false;
+                }
+                break :blk true;
+            },
+            .unresolved,
+            .primitive,
+            .list,
+            .func,
+            .empty_record,
+            .erased,
+            .zst,
+            => false,
+        };
+    }
+
+    fn typeIsProvenUninhabited(self: *BodyContext, ty: Type.TypeId) Allocator.Error!bool {
+        return self.nodeIsProvenUninhabited(try self.activeNodeFromType(ty));
+    }
+
+    fn checkedPatternIsProvenUninhabited(self: *BodyContext, pattern_id: checked.CheckedPatternId) Allocator.Error!bool {
+        const pattern = self.view.bodies.pattern(pattern_id);
+        if (try self.nodeIsProvenUninhabited(try self.instNode(pattern.ty))) return true;
+        return switch (pattern.data) {
+            .as => |as| self.checkedPatternIsProvenUninhabited(as.pattern),
+            .applied_tag => |tag| blk: {
+                for (tag.args) |arg| {
+                    if (try self.checkedPatternIsProvenUninhabited(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .nominal => |nominal| self.checkedPatternIsProvenUninhabited(nominal.backing_pattern),
+            .record_destructure => |destructs| blk: {
+                for (destructs) |destruct| {
+                    const child = switch (destruct.kind) {
+                        .required, .sub_pattern, .rest => |child| child,
+                    };
+                    if (try self.checkedPatternIsProvenUninhabited(child)) break :blk true;
+                }
+                break :blk false;
+            },
+            .list => |list| blk: {
+                for (list.patterns) |child| {
+                    if (try self.checkedPatternIsProvenUninhabited(child)) break :blk true;
+                }
+                if (list.rest) |rest| {
+                    if (rest.pattern) |rest_pattern| {
+                        if (try self.checkedPatternIsProvenUninhabited(rest_pattern)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .tuple => |items| blk: {
+                for (items) |child| {
+                    if (try self.checkedPatternIsProvenUninhabited(child)) break :blk true;
+                }
+                break :blk false;
+            },
+            .str_interpolation => |str| blk: {
+                for (str.steps) |step| {
+                    if (step.capture) |capture| {
+                        if (try self.checkedPatternIsProvenUninhabited(capture)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .pending,
+            .assign,
+            .numeral_literal,
+            .str_literal,
+            .underscore,
+            .runtime_error,
+            => false,
+        };
     }
 
     fn lowerDbgMessage(self: *BodyContext, child: checked.CheckedExprId) Allocator.Error!DraftExprId {
@@ -9127,6 +9485,7 @@ const BodyContext = struct {
                     return try self.localType(local_id);
                 }
             },
+            .field_access => |field| return try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, null)),
             else => {},
         }
         return (try self.callArgumentMonoType(checked_arg, null)) orelse Common.invariant("checked parse intrinsic argument did not lower to a monotype");
@@ -14520,14 +14879,14 @@ const BodyContext = struct {
         };
     }
 
-    fn instantiateCallTypeFromCallerAtType(
+    fn instantiateCallNodeFromCallerAtType(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
         checked_args: []const checked.CheckedExprId,
         expected_ret_ty: ?Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
+    ) Allocator.Error!NodeId {
         const function = self.checkedFunctionType(source_fn_ty);
         if (function.args.len != checked_args.len) {
             Common.invariant("checked direct call arity differs from its function type");
@@ -14580,23 +14939,21 @@ const BodyContext = struct {
                 .args = try self.builder.program.types.addSpan(args),
                 .ret = try self.graph.sealNode(fn_graph.ret),
             } });
-            return generated_fn_ty;
+            return try self.graph.importMono(generated_fn_ty);
         }
-        return try self.activeTypeFromNode(fn_node);
+        return fn_node;
     }
 
-    fn instantiateDispatchPlanCallTypeFromCaller(
+    fn instantiateCallTypeFromCallerAtType(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
-        dispatcher: static_dispatch.StaticDispatchDispatcher,
-        dispatcher_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
-        operands: []const static_dispatch.StaticDispatchOperand,
+        checked_args: []const checked.CheckedExprId,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        const fn_node = try self.instantiateDispatchPlanCallNodeFromCaller(source_fn_ty, dispatcher, dispatcher_ty, caller, checked_ret_ty, operands, expected_ret_ty);
-        return try self.activeTypeFromNode(fn_node);
+        const fn_node = try self.instantiateCallNodeFromCallerAtType(source_fn_ty, caller, checked_ret_ty, checked_args, expected_ret_ty);
+        return try self.sealTypeNode(fn_node);
     }
 
     fn instantiateDispatchPlanCallNodeFromCaller(
@@ -14650,6 +15007,7 @@ const BodyContext = struct {
             .checked_expr => |checked_arg| {
                 const arg_ty = caller.view.bodies.expr(checked_arg).ty;
                 try self.graph.unify(formal_node, try caller.instNode(arg_ty));
+                try self.graph.unify(formal_node, try caller.lowerExprTypeNode(checked_arg));
             },
             .generated_interpolation_iter,
             .generated_numeral,
@@ -14658,14 +15016,14 @@ const BodyContext = struct {
         }
     }
 
-    fn instantiateNumeralPlanCallType(
+    fn instantiateNumeralPlanCallNode(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
         target_ty: Type.TypeId,
         operands: []const static_dispatch.StaticDispatchOperand,
-    ) Allocator.Error!Type.TypeId {
+    ) Allocator.Error!NodeId {
         const function = self.checkedFunctionType(source_fn_ty);
         if (function.args.len != operands.len) {
             Common.invariant("checked from_numeral plan arity differs from its function type");
@@ -14686,17 +15044,7 @@ const BodyContext = struct {
             try self.relateFormalToOperand(formal_node, caller, operand);
         }
         try self.graph.drainDirty();
-        return try self.activeTypeFromNode(fn_node);
-    }
-
-    fn instantiateTargetFromPlan(
-        self: *BodyContext,
-        source_fn_ty: checked.CheckedTypeId,
-        plan_ctx: *BodyContext,
-        plan_fn_ty: checked.CheckedTypeId,
-        expected_ret_ty: ?Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
-        return try self.activeTypeFromNode(try self.instantiateTargetFromPlanNode(source_fn_ty, plan_ctx, plan_fn_ty, expected_ret_ty));
+        return fn_node;
     }
 
     fn instantiateTargetFromPlanNode(
@@ -14729,18 +15077,6 @@ const BodyContext = struct {
         try self.graph.unify(fn_node, plan_node);
         try self.graph.drainDirty();
         return fn_node;
-    }
-
-    fn instantiateTargetCallTypePreservingSourceArgsAndRet(
-        self: *BodyContext,
-        source_fn_ty: checked.CheckedTypeId,
-        ret_ty: Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
-        const function = self.checkedFunctionType(source_fn_ty);
-        const fn_node = try self.instNode(source_fn_ty);
-        try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(ret_ty));
-        try self.graph.drainDirty();
-        return try self.activeTypeFromNode(fn_node);
     }
 
     fn instantiateTargetCallTypeFromMonoArgs(
@@ -14831,22 +15167,68 @@ const BodyContext = struct {
     ) Allocator.Error!?Type.TypeId {
         const expr = self.view.bodies.expr(checked_arg);
         switch (expr.data) {
-            .call => |call| return try self.callResultMonoType(expr.ty, call, expected_ty),
-            .dispatch_call => |plan| return try self.dispatchResultMonoType(expr.ty, plan, expected_ty),
-            .interpolation => |interpolation| return try self.dispatchResultMonoType(expr.ty, interpolation.plan, expected_ty),
-            .type_dispatch_call => |plan| return try self.dispatchResultMonoType(expr.ty, plan, expected_ty),
-            .method_eq => |plan| return try self.dispatchResultMonoType(expr.ty, plan, expected_ty),
-            .field_access => |field| return try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, expected_ty)),
-            .lookup_local => |lookup| return try self.lookupExprMonoType(expr.ty, lookup.resolved),
-            .lookup_external => |resolved| return try self.lookupExprMonoType(expr.ty, resolved),
-            .lookup_required => |resolved| return try self.lookupExprMonoType(expr.ty, resolved),
+            .call => |call| {
+                _ = try self.callResultTypeNode(expr.ty, call, expected_ty);
+                return expected_ty;
+            },
+            .dispatch_call => |plan| {
+                _ = try self.dispatchResultTypeNode(expr.ty, plan, expected_ty);
+                return expected_ty;
+            },
+            .interpolation => |interpolation| {
+                _ = try self.dispatchResultTypeNode(expr.ty, interpolation.plan, expected_ty);
+                return expected_ty;
+            },
+            .type_dispatch_call => |plan| {
+                _ = try self.dispatchResultTypeNode(expr.ty, plan, expected_ty);
+                return expected_ty;
+            },
+            .method_eq => |plan| {
+                _ = try self.dispatchResultTypeNode(expr.ty, plan, expected_ty);
+                return expected_ty;
+            },
+            .field_access => |field| {
+                _ = try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, expected_ty);
+                return expected_ty;
+            },
+            .lookup_local => |lookup| return try self.lookupCallArgumentMonoType(expr.ty, lookup.resolved),
+            .lookup_external => |resolved| return try self.lookupCallArgumentMonoType(expr.ty, resolved),
+            .lookup_required => |resolved| return try self.lookupCallArgumentMonoType(expr.ty, resolved),
             else => {},
         }
         if (expected_ty) |ty| {
             try self.constrainTypeToMono(expr.ty, ty);
             return ty;
         }
-        return try self.lowerTypeView(expr.ty);
+        return null;
+    }
+
+    fn lookupCallArgumentMonoType(
+        self: *BodyContext,
+        checked_ty: checked.CheckedTypeId,
+        maybe_ref: ?checked.ResolvedValueId,
+    ) Allocator.Error!?Type.TypeId {
+        const ref_id = maybe_ref orelse Common.invariant("checked lookup reached Monotype without resolved value ref");
+        const record = self.view.resolved_refs.records[@intFromEnum(ref_id)];
+        switch (record.ref) {
+            .selected_hoisted_const => |selected| {
+                // A selected hoisted constant has a local binder only while
+                // lowering its own root. Every other use consumes the
+                // checker-selected ConstStore entry directly.
+                if (try self.selectedHoistedConstMonoType(selected, checked_ty)) |ty| return ty;
+            },
+            else => {},
+        }
+        if (self.currentLocalForResolvedValue(ref_id) != null) {
+            return try self.lookupExprMonoType(checked_ty, ref_id);
+        }
+        return switch (record.ref) {
+            .top_level_const,
+            .imported_const,
+            .platform_required_const,
+            => null,
+            else => try self.lookupExprMonoType(checked_ty, ref_id),
+        };
     }
 
     fn lookupExprMonoType(
@@ -14932,6 +15314,17 @@ const BodyContext = struct {
         call: anytype,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!?Type.TypeId {
+        const ret_node = try self.callResultTypeNode(checked_ret_ty, call, expected_ret_ty);
+        if (expected_ret_ty) |expected| return expected;
+        return try self.activeTypeFromNode(ret_node);
+    }
+
+    fn callResultTypeNode(
+        self: *BodyContext,
+        checked_ret_ty: checked.CheckedTypeId,
+        call: anytype,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!NodeId {
         if (call.direct_target == null) {
             if (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) |fn_ty| {
                 const ret_ty = self.functionReturnType(fn_ty);
@@ -14940,10 +15333,10 @@ const BodyContext = struct {
                         Common.invariant("checked indirect call result type differed from its expected Monotype type");
                     }
                     try self.constrainTypeToMono(checked_ret_ty, expected);
-                    return expected;
+                    return try self.activeNodeFromType(expected);
                 }
                 try self.constrainTypeToMono(checked_ret_ty, ret_ty);
-                return ret_ty;
+                return try self.activeNodeFromType(ret_ty);
             }
 
             var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
@@ -14954,8 +15347,11 @@ const BodyContext = struct {
             call_ctx.source_region_override = self.source_region_override;
             call_ctx.current_entry_root = self.current_entry_root;
 
-            const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(call.source_fn_ty_payload, self, checked_ret_ty, call.args, expected_ret_ty);
-            return call_ctx.functionReturnType(mono_fn_ty);
+            const fn_node = try call_ctx.instantiateCallNodeFromCallerAtType(call.source_fn_ty_payload, self, checked_ret_ty, call.args, expected_ret_ty);
+            return switch (self.graph.content(fn_node)) {
+                .func => |function| function.ret,
+                else => Common.invariant("checked indirect call instantiated a non-function graph node"),
+            };
         }
 
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
@@ -14967,8 +15363,11 @@ const BodyContext = struct {
         call_ctx.current_entry_root = self.current_entry_root;
 
         const source_fn_ty = self.directCallInstantiationSourceFnType(call.direct_target.?, call.source_fn_ty_payload);
-        const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
-        return call_ctx.functionReturnType(mono_fn_ty);
+        const fn_node = try call_ctx.instantiateCallNodeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+        return switch (self.graph.content(fn_node)) {
+            .func => |function| function.ret,
+            else => Common.invariant("checked direct call instantiated a non-function graph node"),
+        };
     }
 
     fn fnTemplateForDirectCallWithMono(
@@ -15026,7 +15425,22 @@ const BodyContext = struct {
             mono_fn_ty,
             context_fn_key,
         );
-        return try self.builder.lowerNestedFnFromContext(self, local.expr, fn_template, if (evidence.len > 0) evidence else null);
+        // A generalized scope recorded in CheckedModule data owns an evidence frame even
+        // when its vector is empty: descendant constraint depths still count
+        // that lexical scope before reaching the enclosing chain. Monomorphic
+        // locals have no such frame.
+        const owns_evidence_scope = blk: {
+            for (self.view.templates.dispatch_scopes) |scope| {
+                if (scope.checked_expr == local.expr) break :blk true;
+            }
+            break :blk false;
+        };
+        return try self.builder.lowerNestedFnFromContext(
+            self,
+            local.expr,
+            fn_template,
+            if (owns_evidence_scope) evidence else null,
+        );
     }
 
     fn fnDefForProcedureUseWithMono(
@@ -15217,7 +15631,12 @@ const BodyContext = struct {
             => {},
         }
 
-        try self.constrainTypeToMono(checked_ty, ty);
+        switch (record.ref) {
+            // The nested specialization applies its checked scope relations
+            // before joining this contextual graph view.
+            .local_proc => {},
+            else => try self.constrainTypeToMono(checked_ty, ty),
+        }
         const data: BodyExprData = switch (record.ref) {
             .local_param,
             .local_value,
@@ -16127,6 +16546,46 @@ const BodyContext = struct {
         return encoder_expr;
     }
 
+    /// Lower one evaluated constructor child without demanding a value from a
+    /// proven-uninhabited type. Such a child makes construction non-returning,
+    /// represented by its explicit zero-branch match; it is not a runtime
+    /// value.
+    fn lowerConstructorChild(self: *BodyContext, child: checked.CheckedExprId) Allocator.Error!DraftExprId {
+        const expr = self.view.bodies.expr(child);
+        switch (expr.data) {
+            // Aggregate uninhabitedness can be proven by one child while a
+            // sibling still carries checked relations. Recurse through the
+            // aggregate's child-first lowering before its parent seals.
+            .tag,
+            .zero_argument_tag,
+            .nominal,
+            .tuple,
+            .list,
+            .record,
+            .empty_list,
+            .empty_record,
+            => return try self.lowerExpr(child),
+            else => {},
+        }
+        const child_node = try self.lowerExprTypeNode(child);
+        if (try self.nodeIsProvenUninhabited(child_node)) {
+            // The direct uninhabited result must already have an active view.
+            // Do not final-seal a composite node here: an unresolved sibling
+            // still needs its own evaluated lowering relation.
+            return try self.lowerExplicitUninhabitedInvocation(child, try self.activeTypeFromNode(child_node));
+        }
+        return try self.lowerExpr(child);
+    }
+
+    fn lowerConstructorChildSpan(self: *BodyContext, children: []const checked.CheckedExprId) Allocator.Error!DraftSpan(DraftExprId) {
+        const lowered = try self.allocator.alloc(DraftExprId, children.len);
+        defer self.allocator.free(lowered);
+        for (children, 0..) |child, index| {
+            lowered[index] = try self.lowerConstructorChild(child);
+        }
+        return try self.addExprSpan(lowered);
+    }
+
     fn lowerExprSpan(self: *BodyContext, checked_exprs: []const checked.CheckedExprId) Allocator.Error!DraftSpan(DraftExprId) {
         const lowered = try self.allocator.alloc(DraftExprId, checked_exprs.len);
         defer self.allocator.free(lowered);
@@ -16144,7 +16603,10 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftExprId, checked_exprs.len);
         defer self.allocator.free(lowered);
         for (checked_exprs, 0..) |child, i| {
-            lowered[i] = try self.lowerExprAtType(child, elem_ty);
+            lowered[i] = if (try self.typeIsProvenUninhabited(elem_ty))
+                try self.lowerExplicitUninhabitedInvocation(child, elem_ty)
+            else
+                try self.lowerExprAtType(child, elem_ty);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16160,7 +16622,10 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftExprId, checked_exprs.len);
         defer self.allocator.free(lowered);
         for (checked_exprs, stable_tys, 0..) |child, ty, i| {
-            lowered[i] = try self.lowerExprAtType(child, ty);
+            lowered[i] = if (try self.typeIsProvenUninhabited(ty))
+                try self.lowerExplicitUninhabitedInvocation(child, ty)
+            else
+                try self.lowerExprAtType(child, ty);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16170,11 +16635,30 @@ const BodyContext = struct {
         expr: DraftExprId,
     };
 
+    const PreLoweredChild = struct {
+        checked_expr: checked.CheckedExprId,
+        expr: DraftExprId,
+    };
+
+    fn preLoweredChildAt(_: *BodyContext, children: []const PreLoweredChild, checked_expr: checked.CheckedExprId) ?DraftExprId {
+        for (children) |child| {
+            if (child.checked_expr == checked_expr) return child.expr;
+        }
+        return null;
+    }
+
+    fn preLoweredOperandAt(_: *BodyContext, operands: []const PreLoweredOperand, index: usize) ?DraftExprId {
+        for (operands) |operand| {
+            if (operand.index == index) return operand.expr;
+        }
+        return null;
+    }
+
     fn lowerDispatchOperandsAtTypes(
         self: *BodyContext,
         operands: []const static_dispatch.StaticDispatchOperand,
         tys: anytype,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         if (operands.len != GuardedList.borrowLen(tys)) Common.invariant("dispatch argument arity differs from concrete function type");
         const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
@@ -16182,13 +16666,14 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftExprId, operands.len);
         defer self.allocator.free(lowered);
         for (operands, stable_tys, 0..) |operand, ty, i| {
-            if (pre_lowered) |pre| {
+            for (pre_lowered) |pre| {
                 if (pre.index == i) {
                     lowered[i] = pre.expr;
-                    continue;
+                    break;
                 }
+            } else {
+                lowered[i] = try self.lowerDispatchOperandAtType(operand, ty);
             }
-            lowered[i] = try self.lowerDispatchOperandAtType(operand, ty);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16475,6 +16960,15 @@ const BodyContext = struct {
         checked_expr: checked.CheckedExprId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        return self.lowerExprAtTypeWithDemand(checked_expr, ty, .runtime_value);
+    }
+
+    fn lowerExprAtTypeWithDemand(
+        self: *BodyContext,
+        checked_expr: checked.CheckedExprId,
+        ty: Type.TypeId,
+        demand: LoweringDemand,
+    ) Allocator.Error!DraftExprId {
         const expr = self.view.bodies.expr(checked_expr);
         const saved_loc = self.builder.program.current_loc;
         defer self.builder.program.current_loc = saved_loc;
@@ -16487,7 +16981,7 @@ const BodyContext = struct {
             .call => |call| if (try self.lowerInspectOnlyCall(expr.ty, call, ty)) |rendered| return rendered,
             else => {},
         }
-        self.requireLowerableNode(expr, try self.activeNodeFromType(ty), .runtime_value);
+        self.requireLowerableNode(expr, try self.activeNodeFromType(ty), demand);
         if (try self.restoredHoistedExprAtType(checked_expr, ty)) |restored| return restored;
         switch (expr.data) {
             .call => |call| {
@@ -16753,7 +17247,12 @@ const BodyContext = struct {
         return true;
     }
 
-    fn lowerRecordExpr(self: *BodyContext, record: anytype, ty: Type.TypeId) Allocator.Error!DraftExprId {
+    fn lowerRecordExpr(
+        self: *BodyContext,
+        record: anytype,
+        ty: Type.TypeId,
+        pre_lowered: []const PreLoweredChild,
+    ) Allocator.Error!DraftExprId {
         const target_fields = switch (self.builder.shapeContent(ty)) {
             .record => |fields| fields,
             else => Common.invariant("record expression had a non-record monotype"),
@@ -16761,7 +17260,10 @@ const BodyContext = struct {
         const target_field_count: usize = @intCast(target_fields.len);
         const lowered = try self.allocator.alloc(DraftFieldExpr, target_field_count);
         defer self.allocator.free(lowered);
-        const base_record = if (record.ext) |ext| try self.lowerExpr(ext) else null;
+        const base_record = if (record.ext) |ext|
+            self.preLoweredChildAt(pre_lowered, ext) orelse try self.lowerExpr(ext)
+        else
+            null;
         const base_ty = if (base_record) |base_expr| try self.exprType(base_expr) else ty;
         const base_local = if (base_record) |_| try self.addLocal(self.builder.symbols.fresh(), base_ty) else null;
         const base_expr = if (base_local) |local| try self.localExpr(local, base_ty) else null;
@@ -16771,7 +17273,15 @@ const BodyContext = struct {
         for (0..target_field_count) |i| {
             const field = target_field_list[i];
             const value = if (try self.recordUpdateFieldValue(record.fields, field.name)) |field_value|
-                try self.lowerExprAtType(field_value, field.ty)
+                if (self.preLoweredChildAt(pre_lowered, field_value)) |pre| blk: {
+                    if (!self.sameType(field.ty, try self.exprType(pre))) {
+                        Common.invariant("record constructor child lowered at a type different from its finalized field type");
+                    }
+                    break :blk pre;
+                } else if (try self.typeIsProvenUninhabited(field.ty))
+                    try self.lowerExplicitUninhabitedInvocation(field_value, field.ty)
+                else
+                    try self.lowerExprAtType(field_value, field.ty)
             else if (base_expr) |base_value|
                 try self.addExpr(.{
                     .ty = field.ty,
@@ -16931,53 +17441,37 @@ const BodyContext = struct {
                 .structural => {},
             }
         }
-        var callable_mono_ty = try call_ctx.activeTypeFromNode(callable_node);
-        var plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
+        const callable_graph = switch (self.graph.content(callable_node)) {
+            .func => |function| function,
+            else => Common.invariant("checked dispatch plan had a non-function graph node"),
+        };
+        var pre_lowered = std.ArrayList(PreLoweredOperand).empty;
+        defer pre_lowered.deinit(self.allocator);
+        if (self.planUnexecutable(plan) == null) {
+            for (plan_args, 0..) |operand, index| switch (operand) {
+                .checked_expr => |expr| {
+                    const operand_node = try self.lowerExprTypeNode(expr);
+                    try self.graph.unify(callable_graph.args[index], operand_node);
+                    try self.graph.drainDirty();
+                    const deferred_top = self.graph.deferred_templates.items.len;
+                    const lowered = try self.lowerExpr(expr);
+                    try self.builder.drainSpecRequestsFrom(self.graph, deferred_top);
+                    try self.graph.unify(callable_graph.args[index], try self.graph.importMono(try self.exprType(lowered)));
+                    try pre_lowered.append(self.allocator, .{ .index = index, .expr = lowered });
+                },
+                .generated_interpolation_iter,
+                .generated_numeral,
+                .generated_quote,
+                => {},
+            };
+            try self.graph.drainDirty();
+        }
+        const callable_mono_ty = try call_ctx.sealTypeNode(callable_node);
+        const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
         const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
-        var plan_ret_ty = plan_fn_data.ret;
-
-        var dispatcher_ty = try self.dispatcherMonoType(plan, plan_arg_tys);
-        // A dispatcher slot fed only by another method dispatch stays
-        // unresolved until that operand's target resolves. Lowering the
-        // dispatcher operand first supplies the receiver's solved type; the
-        // lowered expression is reused as the call argument.
-        const owner_is_null = methodOwnerFromType(&self.builder.program.types, dispatcher_ty) == null;
-        var pre_lowered: ?PreLoweredOperand = null;
-        if (owner_is_null) {
-            switch (plan.dispatcher) {
-                .arg => |index| {
-                    const deferred_top = self.graph.deferred_templates.items.len;
-                    const lowered = try self.lowerDispatchOperandAtType(plan_args[index], plan_arg_tys[index]);
-                    try self.builder.drainSpecRequestsFrom(self.graph, deferred_top);
-                    switch (plan_args[index]) {
-                        .checked_expr => |expr| _ = try self.callArgumentMonoType(expr, null),
-                        .generated_interpolation_iter,
-                        .generated_numeral,
-                        .generated_quote,
-                        => {},
-                    }
-                    const lowered_ty = try self.exprType(lowered);
-                    pre_lowered = .{
-                        .index = index,
-                        .expr = lowered,
-                    };
-                    callable_mono_ty = try call_ctx.activeTypeFromNode(try call_ctx.instNode(plan.callable_ty));
-                    plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
-                    const refreshed_args = self.builder.program.types.span(plan_fn_data.args);
-                    if (refreshed_args.len != plan_arg_tys.len) {
-                        Common.invariant("checked dispatch plan arity changed after dispatcher pre-lowering");
-                    }
-                    for (0..GuardedList.borrowLen(refreshed_args)) |arg_index| {
-                        plan_arg_tys[arg_index] = GuardedList.at(refreshed_args, arg_index);
-                    }
-                    plan_arg_tys[index] = lowered_ty;
-                    plan_ret_ty = plan_fn_data.ret;
-                    dispatcher_ty = lowered_ty;
-                },
-                .type_only => {},
-            }
-        }
+        const plan_ret_ty = plan_fn_data.ret;
+        for (pre_lowered.items) |lowered| plan_arg_tys[lowered.index] = try self.exprType(lowered.expr);
         // `dispatchTarget` raises the "dispatch plan had no method owner" invariant
         // when the receiver never grounded to a concrete owner and the result mode
         // is not a structural dispatch. That is only reachable inside a bare
@@ -17004,9 +17498,9 @@ const BodyContext = struct {
             return switch (plan.result_mode) {
                 // `.equality` and `.hash` are both handled by lowerStructuralEquality,
                 // which switches on result_mode internally.
-                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .parser_for => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .encoder_for => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered.items),
+                .parser_for => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered.items),
+                .encoder_for => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered.items),
                 .value => Common.invariant("value dispatch plan had no resolved dispatch target"),
             };
         }
@@ -17017,19 +17511,13 @@ const BodyContext = struct {
                 if (!self.sameType(expected, plan_ret_ty)) Common.invariant("checked generated structural dispatch lowered at a type different from its call operand type");
             }
             return switch (generated) {
-                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered.items),
+                .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered.items),
             };
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, expected_ret_ty);
-        try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
-        const refreshed_target_mono_ty = try self.activeTypeFromType(target_mono_ty);
-        if (!self.sameType(callable_mono_ty, refreshed_target_mono_ty)) {
-            Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
-        }
-        const fn_data = self.builder.functionShape(refreshed_target_mono_ty, "checked dispatch target had a non-function type");
+        const fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch target had a non-function type");
         try self.constrainTypeToMono(checked_ret_ty, fn_data.ret);
-        const call_data = try self.lowerResolvedDispatch(plan, resolved, refreshed_target_mono_ty, self, pre_lowered);
+        const call_data = try self.lowerResolvedDispatch(plan, resolved, callable_mono_ty, self, pre_lowered.items);
         const ret_ty = try self.activeTypeFromType(fn_data.ret);
         if (expected_ret_ty) |expected| {
             const expected_ty = try self.activeTypeFromType(expected);
@@ -17095,24 +17583,22 @@ const BodyContext = struct {
         call_ctx.source_region_override = self.source_region_override;
         call_ctx.current_entry_root = self.current_entry_root;
 
-        const callable_mono_ty = try call_ctx.instantiateNumeralPlanCallType(plan.callable_ty, self, checked_ret_ty, target_ty, plan_args);
-        const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
-        const try_ty = plan_fn_data.ret;
+        const callable_node = try call_ctx.instantiateNumeralPlanCallNode(plan.callable_ty, self, checked_ret_ty, target_ty, plan_args);
 
         const resolved = self.dispatchTarget(plan) orelse
             Common.invariant("checked from_numeral dispatch unexpectedly resolved to structural equality");
 
-        const target_mono_ty = try self.activeTypeFromNode(try self.methodTargetNodeFromPlan(resolved, &call_ctx, plan.callable_ty, try_ty));
-        const target_fn_data = self.builder.functionShape(target_mono_ty, "checked from_numeral target had a non-function type");
-        if (!self.sameType(target_fn_data.ret, try_ty)) {
-            Common.invariant("checked from_numeral target return type differed from dispatch plan return type");
-        }
+        const target_node = try self.methodTargetNodeFromPlan(resolved, &call_ctx, plan.callable_ty, null);
+        try self.graph.unify(callable_node, target_node);
+        try self.graph.drainDirty();
+        const callable_mono_ty = try self.sealTypeNode(callable_node);
+        const fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral target had a non-function type");
 
         const call_expr = try self.addExpr(.{
-            .ty = target_fn_data.ret,
-            .data = try self.lowerResolvedDispatch(plan, resolved, target_mono_ty, self, null),
+            .ty = fn_data.ret,
+            .data = try self.lowerResolvedDispatch(plan, resolved, callable_mono_ty, self, &.{}),
         });
-        return .{ .call = call_expr, .try_ty = target_fn_data.ret };
+        return .{ .call = call_expr, .try_ty = fn_data.ret };
     }
 
     fn lowerNumeralRootBody(
@@ -17664,6 +18150,17 @@ const BodyContext = struct {
         maybe_plan: ?static_dispatch.StaticDispatchPlanId,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!?Type.TypeId {
+        const ret_node = try self.dispatchResultTypeNode(checked_ret_ty, maybe_plan, expected_ret_ty);
+        if (expected_ret_ty) |expected| return expected;
+        return try self.activeTypeFromNode(ret_node);
+    }
+
+    fn dispatchResultTypeNode(
+        self: *BodyContext,
+        checked_ret_ty: checked.CheckedTypeId,
+        maybe_plan: ?static_dispatch.StaticDispatchPlanId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!NodeId {
         const plan_id = maybe_plan orelse Common.invariant("checked dispatch expression reached Monotype without a dispatch plan");
         const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
 
@@ -17689,43 +18186,9 @@ const BodyContext = struct {
                 .structural => {},
             }
         }
-        const callable_mono_ty = try call_ctx.activeTypeFromNode(callable_node);
-        const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
-        const plan_ret_ty = plan_fn_data.ret;
-
-        if (self.planUnexecutable(plan) != null) {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
-        }
-        const resolved = self.dispatchTarget(plan) orelse {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
-        };
-        if (self.generatedStructuralDispatchKind(resolved) != null) {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
-        }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, &call_ctx, plan.callable_ty, null);
-        try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
-        if (!self.sameType(callable_mono_ty, target_mono_ty)) {
-            Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
-        }
-        const ret_ty = self.functionReturnType(target_mono_ty);
-        try self.constrainTypeToMono(checked_ret_ty, ret_ty);
-        return ret_ty;
-    }
-
-    fn dispatcherMonoType(
-        self: *BodyContext,
-        plan: static_dispatch.StaticDispatchCallPlan,
-        arg_tys: []const Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
-        return switch (plan.dispatcher) {
-            .arg => |index| blk: {
-                if (index >= arg_tys.len) Common.invariant("dispatch plan dispatcher argument index was outside the argument span");
-                break :blk arg_tys[index];
-            },
-            .type_only => try self.sealCheckedType(plan.dispatcher_ty),
+        return switch (self.graph.content(callable_node)) {
+            .func => |function| function.ret,
+            else => Common.invariant("checked dispatch plan had a non-function graph node"),
         };
     }
 
@@ -18013,16 +18476,6 @@ const BodyContext = struct {
         if (!moduleBytesEqual(lookup.view.key.bytes, self.view.key.bytes)) {
             Common.invariant("local method dispatch target belonged to a different checked module view");
         }
-    }
-
-    fn methodTargetMonoTypeFromPlan(
-        self: *BodyContext,
-        lookup: MethodLookup,
-        plan_ctx: *BodyContext,
-        plan_callable_ty: checked.CheckedTypeId,
-        expected_ret_ty: ?Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
-        return try self.activeTypeFromNode(try self.methodTargetNodeFromPlan(lookup, plan_ctx, plan_callable_ty, expected_ret_ty));
     }
 
     fn methodTargetNodeFromPlan(
@@ -18351,7 +18804,7 @@ const BodyContext = struct {
         lookup: MethodLookup,
         callable_mono_ty: Type.TypeId,
         arg_ctx: *BodyContext,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!BodyExprData {
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch target had a non-function type");
         const args = try arg_ctx.lowerDispatchOperandsAtTypes(plan.argsSlice(self.view.static_dispatch_plans), self.builder.program.types.span(fn_data.args), pre_lowered);
@@ -18367,11 +18820,11 @@ const BodyContext = struct {
         callable_mono_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         arg_ctx: *BodyContext,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!DraftExprId {
         return switch (plan.result_mode) {
             .equality => |eq| if (eq.structural_allowed) blk: {
-                const operands = try self.lowerStructuralEqualityOperands(plan, arg_ctx);
+                const operands = try self.lowerStructuralBinaryOperands("equality", plan, callable_mono_ty, arg_ctx, pre_lowered);
                 var result = try self.lowerEqualityExpr(operands.derived_ty, operands.first, operands.second, self.view.names.methodNameText(plan.method), ret_ty);
                 if (eq.negated) {
                     result = try self.lowLevelExpr(.bool_not, &.{result}, ret_ty);
@@ -18396,31 +18849,6 @@ const BodyContext = struct {
         derived_ty: Type.TypeId,
     };
 
-    fn lowerStructuralEqualityOperands(
-        self: *BodyContext,
-        plan: static_dispatch.StaticDispatchCallPlan,
-        arg_ctx: *BodyContext,
-    ) Allocator.Error!StructuralBinaryOperands {
-        const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
-        if (plan_args.len != 2) Common.invariant("structural equality dispatch plan must have two operands");
-        const lhs_expr = switch (plan_args[0]) {
-            .checked_expr => |expr| expr,
-            else => Common.invariant("structural equality operand was not a checked expression"),
-        };
-        const rhs_expr = switch (plan_args[1]) {
-            .checked_expr => |expr| expr,
-            else => Common.invariant("structural equality operand was not a checked expression"),
-        };
-        const operand_ty = try arg_ctx.structuralEqualityOperandType(.{ .lhs = lhs_expr, .rhs = rhs_expr });
-        const first = try arg_ctx.lowerExprAtType(lhs_expr, operand_ty);
-        const second = try arg_ctx.lowerExprAtType(rhs_expr, operand_ty);
-        return .{
-            .first = first,
-            .second = second,
-            .derived_ty = operand_ty,
-        };
-    }
-
     /// Lower the value and hasher operands of a structural hash dispatch,
     /// honoring a `pre_lowered` operand at index 0 or 1. `noun` is the derivation
     /// name used only in invariant diagnostics.
@@ -18430,7 +18858,7 @@ const BodyContext = struct {
         plan: static_dispatch.StaticDispatchCallPlan,
         callable_mono_ty: Type.TypeId,
         arg_ctx: *BodyContext,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!StructuralBinaryOperands {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (plan_args.len != 2) Common.invariant("structural " ++ noun ++ " dispatch plan must have two operands");
@@ -18440,13 +18868,9 @@ const BodyContext = struct {
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 2) Common.invariant("structural " ++ noun ++ " callable type must have two operands");
-        const first = if (pre_lowered != null and pre_lowered.?.index == 0)
-            pre_lowered.?.expr
-        else
+        const first = self.preLoweredOperandAt(pre_lowered, 0) orelse
             try arg_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
-        const second = if (pre_lowered != null and pre_lowered.?.index == 1)
-            pre_lowered.?.expr
-        else
+        const second = self.preLoweredOperandAt(pre_lowered, 1) orelse
             try arg_ctx.lowerDispatchOperandAtType(plan_args[1], arg_tys[1]);
         return .{ .first = first, .second = second, .derived_ty = arg_tys[0] };
     }
@@ -18457,7 +18881,7 @@ const BodyContext = struct {
         callable_mono_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         arg_ctx: *BodyContext,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!DraftExprId {
         const parser = switch (plan.result_mode) {
             .parser_for => |parser_for| parser_for,
@@ -18527,9 +18951,7 @@ const BodyContext = struct {
             }
         }
 
-        const encoding_value = if (pre_lowered != null and pre_lowered.?.index == 0)
-            pre_lowered.?.expr
-        else
+        const encoding_value = self.preLoweredOperandAt(pre_lowered, 0) orelse
             try arg_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
         const encoding_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[0]);
         self.setLocalCaptureId(encoding_local, parserEncodingCaptureId());
@@ -18586,7 +19008,7 @@ const BodyContext = struct {
         callable_mono_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         arg_ctx: *BodyContext,
-        pre_lowered: ?PreLoweredOperand,
+        pre_lowered: []const PreLoweredOperand,
     ) Allocator.Error!DraftExprId {
         const encoder_for = switch (plan.result_mode) {
             .encoder_for => |encoder_for| encoder_for,
@@ -18609,9 +19031,7 @@ const BodyContext = struct {
         const shape_ty = try self.sealCheckedType(plan.dispatcher_ty);
         if (!self.encodeFieldTypeIsSupported(shape_ty, arg_tys[0])) Common.invariant("structural encoder_for dispatcher was not a supported structural type");
 
-        const encoding_value = if (pre_lowered != null and pre_lowered.?.index == 0)
-            pre_lowered.?.expr
-        else
+        const encoding_value = self.preLoweredOperandAt(pre_lowered, 0) orelse
             try arg_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
 
         const encoding_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[0]);
@@ -20413,9 +20833,15 @@ const BodyContext = struct {
     }
 
     fn typeIsClosedEmptyTagUnion(self: *BodyContext, ty: Type.TypeId) bool {
-        return switch (self.builder.shapeContent(ty)) {
-            .tag_union => |span| self.builder.program.types.tagSpan(span).len == 0,
-            else => false,
+        var current = ty;
+        while (true) switch (self.builder.program.types.get(current)) {
+            .named => |named| {
+                const backing = named.backing orelse return false;
+                if (backing.use != .inspectable) return false;
+                current = backing.ty;
+            },
+            .tag_union => |span| return self.builder.program.types.tagSpan(span).len == 0,
+            else => return false,
         };
     }
 
@@ -21283,6 +21709,9 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         if (self.checkedExprDivergesInLoweredRuntime(body)) {
             return try self.lowerDivergentExprAtType(body, result_ty);
+        }
+        if (try self.typeIsProvenUninhabited(result_ty)) {
+            return try self.lowerExplicitUninhabitedInvocation(body, result_ty);
         }
         return try self.lowerExprAtType(body, result_ty);
     }
@@ -22383,58 +22812,70 @@ const BodyContext = struct {
     }
 
     fn lowerMatch(self: *BodyContext, match: anytype, output: MatchOutput, comptime_site: ?DraftComptimeSiteId) Allocator.Error!BodyExprData {
-        const scrutinee_ty = try self.matchScrutineeType(match);
-        const scrutinee = try self.lowerExprAtType(match.cond, scrutinee_ty);
+        const PendingBranch = struct {
+            ctx: BodyContext,
+            pattern: checked.CheckedMatchBranchPattern,
+            user_guard: ?DraftExprId,
+            body: DraftExprId,
+        };
+
+        const scrutinee_node = try self.lowerExprTypeNode(match.cond);
         const branches = try self.allocator.alloc(DraftBranch, branchCount(match.branches));
         defer self.allocator.free(branches);
-        var index: usize = 0;
+        var pending = std.ArrayListUnmanaged(PendingBranch).empty;
+        defer {
+            for (pending.items) |*entry| entry.ctx.deinit();
+            pending.deinit(self.allocator);
+        }
+        var source_index: usize = 0;
         for (match.branches) |branch| {
             for (branch.patternsSlice(self.view.bodies)) |pattern| {
+                defer source_index += 1;
+                if (try self.checkedPatternIsProvenUninhabited(pattern.pattern)) continue;
                 var branch_ctx = try self.childContext(self.current_fn_key);
-                defer branch_ctx.deinit();
-                var saved = std.ArrayList(BinderRestore).empty;
-                defer saved.deinit(self.allocator);
-                try branch_ctx.saveMatchPatternBinders(pattern, &saved);
-                defer branch_ctx.restoreBinders(saved.items);
-
-                const pat = try branch_ctx.lowerPatternAtType(pattern.pattern, scrutinee_ty);
+                errdefer branch_ctx.deinit();
+                try branch_ctx.preRegisterPatternBindersFromCheckedTypes(pattern.pattern);
                 try branch_ctx.applyAlternativeBinderRemaps(pattern.binderRemapsSlice(self.view.bodies));
                 const user_guard = if (branch.guard) |guard_expr| try branch_ctx.lowerExpr(guard_expr) else null;
-                const guard = try branch_ctx.conjoinPatternLiteralGuards(user_guard);
                 const body = try branch_ctx.wrapComptimeBranch(
                     comptime_site,
-                    index,
+                    source_index,
                     try branch_ctx.lowerMatchBranchBody(branch.value, output),
                 );
-                branches[index] = .{
-                    .pat = pat,
-                    .guard = guard,
+                try self.graph.unify(scrutinee_node, try branch_ctx.instNode(branch_ctx.view.bodies.pattern(pattern.pattern).ty));
+                try pending.append(self.allocator, .{
+                    .ctx = branch_ctx,
+                    .pattern = pattern,
+                    .user_guard = user_guard,
                     .body = body,
-                };
-                index += 1;
+                });
             }
+        }
+
+        try self.graph.drainDirty();
+        const scrutinee_ty = try self.sealTypeNode(scrutinee_node);
+        const scrutinee = if (try self.typeIsProvenUninhabited(scrutinee_ty))
+            try self.lowerUninhabitedScrutinee(match.cond, scrutinee_ty)
+        else
+            try self.lowerExprAtType(match.cond, scrutinee_ty);
+        var index: usize = 0;
+        for (pending.items) |*entry| {
+            entry.ctx.reuse_pre_registered_pattern_binders = true;
+            const pat = try entry.ctx.lowerPatternAtType(entry.pattern.pattern, scrutinee_ty);
+            if (try entry.ctx.checkedPatternIsProvenUninhabited(entry.pattern.pattern)) continue;
+            const guard = try entry.ctx.conjoinPatternLiteralGuards(entry.user_guard);
+            branches[index] = .{
+                .pat = pat,
+                .guard = guard,
+                .body = entry.body,
+            };
+            index += 1;
         }
         return .{ .match_ = .{
             .scrutinee = scrutinee,
-            .branches = try self.addBranchSpan(branches),
+            .branches = try self.addBranchSpan(branches[0..index]),
             .comptime_site = comptime_site,
         } };
-    }
-
-    fn matchScrutineeType(self: *BodyContext, match: anytype) Allocator.Error!Type.TypeId {
-        return try self.lowerExprType(match.cond);
-    }
-
-    fn saveMatchPatternBinders(
-        self: *BodyContext,
-        pattern: checked.CheckedMatchBranchPattern,
-        saved: *std.ArrayList(BinderRestore),
-    ) Allocator.Error!void {
-        try self.savePatternBinders(pattern.pattern, saved);
-        for (pattern.binderRemapsSlice(self.view.bodies)) |remap| {
-            try self.saveBinder(remap.candidate_binder, saved);
-            try self.saveBinder(remap.representative_binder, saved);
-        }
     }
 
     fn savePatternBinders(
@@ -22702,18 +23143,37 @@ const BodyContext = struct {
             .block => |block| {
                 const statements = try self.lowerBlockStatements(block.statements);
                 defer self.allocator.free(statements.items);
-                const value = if (statements.diverges)
-                    try self.unreachableAfterDivergentStatementExpr(result_ty)
-                else if (self.checkedExprDivergesInLoweredRuntime(block.final_expr))
-                    try self.lowerDivergentExprAtType(block.final_expr, result_ty)
-                else
-                    try self.lowerExprAtType(block.final_expr, result_ty);
+                switch (statements.termination) {
+                    .uninhabited => |scrutinee| return try self.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
+                        .statements = try self.addStmtSpan(statements.items[0..statements.len]),
+                        .final_expr = try self.zeroBranchMatch(scrutinee, state_ty),
+                    } } }),
+                    .none, .checked_control_transfer => {},
+                }
+                if (statementTerminationIsNone(statements.termination) and try self.typeIsProvenUninhabited(result_ty)) {
+                    const scrutinee = try self.lowerUninhabitedScrutinee(block.final_expr, result_ty);
+                    return try self.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
+                        .statements = try self.addStmtSpan(statements.items[0..statements.len]),
+                        .final_expr = try self.zeroBranchMatch(scrutinee, state_ty),
+                    } } });
+                }
+                const value = switch (statements.termination) {
+                    .checked_control_transfer => try self.unreachableAfterDivergentStatementExpr(result_ty),
+                    .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, result_ty),
+                    .none => if (self.checkedExprDivergesInLoweredRuntime(block.final_expr))
+                        try self.lowerDivergentExprAtType(block.final_expr, result_ty)
+                    else
+                        try self.lowerExprAtType(block.final_expr, result_ty),
+                };
                 return try self.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
                     .statements = try self.addStmtSpan(statements.items[0..statements.len]),
                     .final_expr = try self.stateResultAfterValue(state_ty, merge_binders, result_ty, value),
                 } } });
             },
             else => {
+                if (try self.typeIsProvenUninhabited(result_ty)) {
+                    return try self.zeroBranchMatch(try self.lowerUninhabitedScrutinee(body, result_ty), state_ty);
+                }
                 const value = try self.lowerExprAtType(body, result_ty);
                 return try self.stateResultAfterValue(state_ty, merge_binders, result_ty, value);
             },
@@ -22733,37 +23193,63 @@ const BodyContext = struct {
             .block => |block| {
                 var statements = try self.lowerBlockStatements(block.statements);
                 defer self.allocator.free(statements.items);
-                if (!statements.diverges) {
-                    const final_stmt = try self.lowerDiscardedExprStatement(
+                if (statementTerminationIsNone(statements.termination)) {
+                    const final_result = try self.lowerDiscardedExprStatement(
                         block.final_expr,
                         try self.lowerTypeView(checked_body.ty),
                     );
-                    try statements.append(self.allocator, final_stmt);
+                    if (final_result.stmt) |stmt| try statements.append(self.allocator, stmt);
+                    statements.termination = final_result.termination;
                 }
                 return try self.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
                     .statements = try self.addStmtSpan(statements.items[0..statements.len]),
-                    .final_expr = try self.stateOnlyTupleExpr(state_ty, merge_binders),
+                    .final_expr = switch (statements.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, state_ty),
+                        .none, .checked_control_transfer => try self.stateOnlyTupleExpr(state_ty, merge_binders),
+                    },
                 } } });
             },
             else => {
-                const stmt = try self.lowerDiscardedExprStatement(body, try self.lowerTypeView(checked_body.ty));
+                const result = try self.lowerDiscardedExprStatement(body, try self.lowerTypeView(checked_body.ty));
+                const stmt_ids = if (result.stmt) |stmt| &[_]DraftStmtId{stmt} else &[_]DraftStmtId{};
                 return try self.addExpr(.{ .ty = state_ty, .data = .{ .block = .{
-                    .statements = try self.addStmtSpan(&[_]DraftStmtId{stmt}),
-                    .final_expr = try self.stateOnlyTupleExpr(state_ty, merge_binders),
+                    .statements = try self.addStmtSpan(stmt_ids),
+                    .final_expr = switch (result.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, state_ty),
+                        .none, .checked_control_transfer => try self.stateOnlyTupleExpr(state_ty, merge_binders),
+                    },
                 } } });
             },
         }
     }
 
+    const LoweredDiscardedExpr = struct {
+        stmt: ?DraftStmtId,
+        termination: StatementTermination,
+    };
+
     fn lowerDiscardedExprStatement(
         self: *BodyContext,
         expr_id: checked.CheckedExprId,
         divergent_ty: Type.TypeId,
-    ) Allocator.Error!DraftStmtId {
+    ) Allocator.Error!LoweredDiscardedExpr {
         if (self.checkedExprDivergesInLoweredRuntime(expr_id)) {
-            return try self.addStmt(.{ .expr = try self.lowerDivergentExprAtType(expr_id, divergent_ty) });
+            return .{
+                .stmt = try self.addStmt(.{ .expr = try self.lowerDivergentExprAtType(expr_id, divergent_ty) }),
+                .termination = .checked_control_transfer,
+            };
         }
-        return try self.addStmt(try self.lowerExprStatement(expr_id));
+        const node = try self.lowerExprTypeNode(expr_id);
+        if (try self.nodeIsProvenUninhabited(node)) {
+            return .{
+                .stmt = null,
+                .termination = .{ .uninhabited = try self.lowerUninhabitedScrutinee(expr_id, try self.activeTypeFromNode(node)) },
+            };
+        }
+        return .{
+            .stmt = try self.addStmt(try self.lowerExprStatement(expr_id)),
+            .termination = .none,
+        };
     }
 
     fn stateResultTupleExpr(
@@ -22851,19 +23337,29 @@ const BodyContext = struct {
         defer self.allocator.free(stmts.items);
         return .{ .block = .{
             .statements = try self.addStmtSpan(stmts.items[0..stmts.len]),
-            .final_expr = if (stmts.diverges)
-                try self.unreachableAfterDivergentStatementExpr(ty)
-            else if (self.checkedExprDivergesInLoweredRuntime(block.final_expr))
-                try self.lowerDivergentExprAtType(block.final_expr, ty)
-            else
-                try self.lowerExprAtType(block.final_expr, ty),
+            .final_expr = switch (stmts.termination) {
+                .checked_control_transfer => try self.unreachableAfterDivergentStatementExpr(ty),
+                .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, ty),
+                .none => if (self.checkedExprDivergesInLoweredRuntime(block.final_expr))
+                    try self.lowerDivergentExprAtType(block.final_expr, ty)
+                else if (try self.typeIsProvenUninhabited(ty))
+                    try self.lowerExplicitUninhabitedInvocation(block.final_expr, ty)
+                else
+                    try self.lowerExprAtType(block.final_expr, ty),
+            },
         } };
     }
+
+    const StatementTermination = union(enum) {
+        none,
+        checked_control_transfer,
+        uninhabited: DraftExprId,
+    };
 
     const LoweredStatements = struct {
         items: []DraftStmtId,
         len: usize,
-        diverges: bool,
+        termination: StatementTermination,
 
         fn append(self: *LoweredStatements, allocator: Allocator, stmt: DraftStmtId) Allocator.Error!void {
             if (self.len == self.items.len) {
@@ -22880,16 +23376,58 @@ const BodyContext = struct {
         var lowered = LoweredStatements{
             .items = items,
             .len = 0,
-            .diverges = false,
+            .termination = .none,
         };
         for (checked_statements) |statement| {
             if (!self.checkedStatementHasRuntimeEffect(statement)) continue;
-            if (!try self.appendExpandedPatternStatement(statement, &lowered)) {
-                try lowered.append(self.allocator, try self.lowerStatement(statement));
+            if (try self.lowerUninhabitedStatementScrutinee(statement)) |scrutinee| {
+                lowered.termination = .{ .uninhabited = scrutinee };
+                break;
             }
-            if (self.checkedStatementDivergesInLoweredRuntime(statement)) lowered.diverges = true;
+            var termination: StatementTermination = if (self.checkedStatementDivergesInLoweredRuntime(statement))
+                .checked_control_transfer
+            else
+                .none;
+            if (!try self.appendExpandedPatternStatement(statement, &lowered)) {
+                const statement_result = try self.lowerStatement(statement);
+                if (statement_result.stmt) |stmt| try lowered.append(self.allocator, stmt);
+                termination = statement_result.termination;
+            }
+            switch (termination) {
+                .none => {},
+                else => {
+                    lowered.termination = termination;
+                    break;
+                },
+            }
         }
         return lowered;
+    }
+
+    fn lowerUninhabitedStatementScrutinee(
+        self: *BodyContext,
+        statement_id: checked.CheckedStatementId,
+    ) Allocator.Error!?DraftExprId {
+        const statement = self.view.bodies.statement(statement_id);
+        const expr_id = switch (statement.data) {
+            .decl => |decl| if (self.statementValueIsLocalProc(decl.expr)) return null else decl.expr,
+            .var_ => |decl| decl.expr,
+            .reassign => |decl| decl.expr,
+            .expr => |expr| expr,
+            .dbg => |expr| expr,
+            .expect => |expr| if (self.builder.inline_expects == .run) expr else return null,
+            else => return null,
+        };
+        const node = try self.lowerExprTypeNode(expr_id);
+        if (!try self.nodeIsProvenUninhabited(node)) return null;
+        return try self.lowerUninhabitedScrutinee(expr_id, try self.activeTypeFromNode(node));
+    }
+
+    fn statementTerminationIsNone(termination: StatementTermination) bool {
+        return switch (termination) {
+            .none => true,
+            .checked_control_transfer, .uninhabited => false,
+        };
     }
 
     fn appendExpandedPatternStatement(
@@ -23389,7 +23927,10 @@ const BodyContext = struct {
             .pat = try self.iteratorDonePattern(step),
             .body = done_body,
         };
-        branches[1] = try self.iteratorOneBranch(for_, result_ty, step, iterator_ty, carries);
+        branches[1] = if (try self.typeIsProvenUninhabited(item_ty))
+            try self.uninhabitedIteratorOneBranch(step, done_body)
+        else
+            try self.iteratorOneBranch(for_, result_ty, step, iterator_ty, carries);
         branches[2] = try self.iteratorSkipBranch(result_ty, step, iterator_ty, carries);
 
         const match_expr = try self.addExpr(.{
@@ -23479,7 +24020,12 @@ const BodyContext = struct {
         call_ctx.source_region_override = self.source_region_override;
         call_ctx.current_entry_root = self.current_entry_root;
 
-        const callable_mono_ty = try call_ctx.instantiateIteratorPlanCallTypeFromCaller(plan.callable_ty, self, plan_args, loop_iterator, expected_ret_ty);
+        const lookup = self.iteratorMethodLookup(plan);
+        const callable_node = try call_ctx.instantiateIteratorPlanCallNodeFromCaller(plan.callable_ty, self, plan_args, loop_iterator, expected_ret_ty);
+        const target_node = try self.methodTargetNodeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
+        try self.graph.unify(callable_node, target_node);
+        try self.graph.drainDirty();
+        const callable_mono_ty = try self.sealTypeNode(callable_node);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked iterator dispatch plan had a non-function type");
         const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
@@ -23496,44 +24042,7 @@ const BodyContext = struct {
         if (!self.sameType(dispatcher_ty, actual_dispatcher_ty)) {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
-        const lookup: MethodLookup = blk: {
-            // Consume the checked or edge-supplied resolution.
-            switch (plan.resolution) {
-                .direct => |node_id| {
-                    const node = self.view.static_dispatch_plans.evidenceNode(node_id);
-                    var consumed = self.methodLookupForResolvedTarget(node.target);
-                    consumed.instantiation = switch (node.instantiation) {
-                        .monomorphic => null,
-                        .callable => |callable_ty| .{ .view = self.view, .callable_ty = callable_ty },
-                    };
-                    break :blk consumed;
-                },
-                .constraint => |constraint_ref| {
-                    if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
-                        .target => |target| {
-                            const consumed: MethodLookup = .{
-                                .view = target.view,
-                                .target = target.target,
-                                .instantiation = target.instantiation,
-                            };
-                            break :blk consumed;
-                        },
-                        .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
-                    } else {
-                        Common.invariant("iterator method evidence was absent from its lexical chain");
-                    }
-                },
-                .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
-            }
-        };
-
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, &call_ctx, plan.callable_ty, expected_ret_ty);
-        try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
-        if (!self.sameType(callable_mono_ty, target_mono_ty)) {
-            Common.invariant("checked iterator dispatch target callable type differed from dispatch plan callable type");
-        }
-
-        const fn_data = self.builder.functionShape(target_mono_ty, "checked iterator dispatch target had a non-function type");
+        const fn_data = self.builder.functionShape(callable_mono_ty, "checked iterator dispatch target had a non-function type");
         if (expected_ret_ty) |expected| {
             if (!self.sameType(fn_data.ret, expected)) {
                 Common.invariant("checked iterator dispatch target return type differed from iterator-for expected type");
@@ -23549,20 +24058,43 @@ const BodyContext = struct {
         return try self.addExpr(.{
             .ty = fn_data.ret,
             .data = .{ .call_proc = .{
-                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, target_mono_ty, try self.evidenceForIteratorCall(plan)))),
+                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, try self.evidenceForIteratorCall(plan)))),
                 .args = try self.addExprSpan(args),
             } },
         });
     }
 
-    fn instantiateIteratorPlanCallTypeFromCaller(
+    fn iteratorMethodLookup(self: *BodyContext, plan: static_dispatch.IteratorDispatchCall) MethodLookup {
+        return switch (plan.resolution) {
+            .direct => |node_id| blk: {
+                const node = self.view.static_dispatch_plans.evidenceNode(node_id);
+                var lookup = self.methodLookupForResolvedTarget(node.target);
+                lookup.instantiation = switch (node.instantiation) {
+                    .monomorphic => null,
+                    .callable => |callable_ty| .{ .view = self.view, .callable_ty = callable_ty },
+                };
+                break :blk lookup;
+            },
+            .constraint => |constraint_ref| if (self.evidence.at(constraint_ref)) |entry| switch (entry) {
+                .target => |target| .{
+                    .view = target.view,
+                    .target = target.target,
+                    .instantiation = target.instantiation,
+                },
+                .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
+            } else Common.invariant("iterator method evidence was absent from its lexical chain"),
+            .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
+        };
+    }
+
+    fn instantiateIteratorPlanCallNodeFromCaller(
         self: *BodyContext,
         source_fn_ty: checked.CheckedTypeId,
         caller: *BodyContext,
         operands: []const static_dispatch.IteratorDispatchOperand,
         loop_iterator: ?BodyTypedLocal,
         expected_ret_ty: ?Type.TypeId,
-    ) Allocator.Error!Type.TypeId {
+    ) Allocator.Error!NodeId {
         const function = self.checkedFunctionType(source_fn_ty);
         if (function.args.len != operands.len) {
             Common.invariant("checked iterator dispatch target arity differs from its function type");
@@ -23588,7 +24120,7 @@ const BodyContext = struct {
             try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
         }
         try self.graph.drainDirty();
-        return try self.activeTypeFromNode(fn_node);
+        return fn_node;
     }
 
     fn iteratorOperandMonoType(
@@ -23674,6 +24206,19 @@ const BodyContext = struct {
         return .{ .pat = tag_pat, .body = block };
     }
 
+    fn uninhabitedIteratorOneBranch(
+        self: *BodyContext,
+        step: IterStepShape,
+        body: DraftExprId,
+    ) Allocator.Error!DraftBranch {
+        const payload_pat = try self.addPatWithTypeCell(try self.lowerTypeCell(step.one_payload_ty), .wildcard);
+        const tag_pat = try self.addPatWithTypeCell(try self.lowerTypeCell(step.step_ty), .{ .tag = .{
+            .name = try self.builder.tagName(self.view, step.one_tag),
+            .payloads = try self.addPatSpan(&[_]DraftPatId{payload_pat}),
+        } });
+        return .{ .pat = tag_pat, .body = body };
+    }
+
     fn lowerIteratorBodyThenContinue(
         self: *BodyContext,
         body: checked.CheckedExprId,
@@ -23684,29 +24229,30 @@ const BodyContext = struct {
         const checked_body = self.view.bodies.expr(body);
         switch (checked_body.data) {
             .block => |block| {
-                var statement_diverges = false;
-                for (block.statements) |statement| {
-                    if (self.checkedStatementDivergesInLoweredRuntime(statement)) statement_diverges = true;
-                }
-                const extra: usize = if (statement_diverges) 0 else 1;
-                const lowered_statements = try self.allocator.alloc(DraftStmtId, block.statements.len + extra);
-                defer self.allocator.free(lowered_statements);
-                for (block.statements, 0..) |statement, i| {
-                    lowered_statements[i] = try self.lowerStatement(statement);
-                }
-                if (!statement_diverges) {
-                    lowered_statements[block.statements.len] = try self.lowerDiscardedExprStatement(block.final_expr, result_ty);
+                var statements = try self.lowerBlockStatements(block.statements);
+                defer self.allocator.free(statements.items);
+                if (statementTerminationIsNone(statements.termination)) {
+                    const final_result = try self.lowerDiscardedExprStatement(block.final_expr, result_ty);
+                    if (final_result.stmt) |stmt| try statements.append(self.allocator, stmt);
+                    statements.termination = final_result.termination;
                 }
                 return try self.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
-                    .statements = try self.addStmtSpan(lowered_statements),
-                    .final_expr = try self.continueWithState(result_ty, rest_expr, carries),
+                    .statements = try self.addStmtSpan(statements.items[0..statements.len]),
+                    .final_expr = switch (statements.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, result_ty),
+                        .none, .checked_control_transfer => try self.continueWithState(result_ty, rest_expr, carries),
+                    },
                 } } });
             },
             else => {
-                const body_stmt = try self.lowerDiscardedExprStatement(body, result_ty);
+                const body_result = try self.lowerDiscardedExprStatement(body, result_ty);
+                const stmt_ids = if (body_result.stmt) |stmt| &[_]DraftStmtId{stmt} else &[_]DraftStmtId{};
                 return try self.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
-                    .statements = try self.addStmtSpan(&[_]DraftStmtId{body_stmt}),
-                    .final_expr = try self.continueWithState(result_ty, rest_expr, carries),
+                    .statements = try self.addStmtSpan(stmt_ids),
+                    .final_expr = switch (body_result.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, result_ty),
+                        .none, .checked_control_transfer => try self.continueWithState(result_ty, rest_expr, carries),
+                    },
                 } } });
             },
         }
@@ -23721,29 +24267,30 @@ const BodyContext = struct {
         const checked_body = self.view.bodies.expr(body);
         switch (checked_body.data) {
             .block => |block| {
-                var statement_diverges = false;
-                for (block.statements) |statement| {
-                    if (self.checkedStatementDivergesInLoweredRuntime(statement)) statement_diverges = true;
-                }
-                const extra: usize = if (statement_diverges) 0 else 1;
-                const lowered_statements = try self.allocator.alloc(DraftStmtId, block.statements.len + extra);
-                defer self.allocator.free(lowered_statements);
-                for (block.statements, 0..) |statement, i| {
-                    lowered_statements[i] = try self.lowerStatement(statement);
-                }
-                if (!statement_diverges) {
-                    lowered_statements[block.statements.len] = try self.lowerDiscardedExprStatement(block.final_expr, result_ty);
+                var statements = try self.lowerBlockStatements(block.statements);
+                defer self.allocator.free(statements.items);
+                if (statementTerminationIsNone(statements.termination)) {
+                    const final_result = try self.lowerDiscardedExprStatement(block.final_expr, result_ty);
+                    if (final_result.stmt) |stmt| try statements.append(self.allocator, stmt);
+                    statements.termination = final_result.termination;
                 }
                 return try self.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
-                    .statements = try self.addStmtSpan(lowered_statements),
-                    .final_expr = try self.continueWithCurrentState(result_ty, carries),
+                    .statements = try self.addStmtSpan(statements.items[0..statements.len]),
+                    .final_expr = switch (statements.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, result_ty),
+                        .none, .checked_control_transfer => try self.continueWithCurrentState(result_ty, carries),
+                    },
                 } } });
             },
             else => {
-                const body_stmt = try self.lowerDiscardedExprStatement(body, result_ty);
+                const body_result = try self.lowerDiscardedExprStatement(body, result_ty);
+                const stmt_ids = if (body_result.stmt) |stmt| &[_]DraftStmtId{stmt} else &[_]DraftStmtId{};
                 return try self.addExpr(.{ .ty = result_ty, .data = .{ .block = .{
-                    .statements = try self.addStmtSpan(&[_]DraftStmtId{body_stmt}),
-                    .final_expr = try self.continueWithCurrentState(result_ty, carries),
+                    .statements = try self.addStmtSpan(stmt_ids),
+                    .final_expr = switch (body_result.termination) {
+                        .uninhabited => |scrutinee| try self.zeroBranchMatch(scrutinee, result_ty),
+                        .none, .checked_control_transfer => try self.continueWithCurrentState(result_ty, carries),
+                    },
                 } } });
             },
         }
@@ -24196,7 +24743,17 @@ const BodyContext = struct {
         };
     }
 
-    fn lowerStatement(self: *BodyContext, statement_id: checked.CheckedStatementId) Allocator.Error!DraftStmtId {
+    const LoweredStatement = struct {
+        stmt: ?DraftStmtId,
+        termination: StatementTermination,
+    };
+
+    const LoweredPatternStatement = struct {
+        stmt: ?DraftStmt,
+        termination: StatementTermination,
+    };
+
+    fn lowerStatement(self: *BodyContext, statement_id: checked.CheckedStatementId) Allocator.Error!LoweredStatement {
         const statement = self.view.bodies.statement(statement_id);
         const saved_loc = self.builder.program.current_loc;
         defer self.builder.program.current_loc = saved_loc;
@@ -24204,6 +24761,7 @@ const BodyContext = struct {
         defer self.builder.program.current_region = saved_region;
         self.builder.program.current_loc = try self.sourceLocFor(statement.source_region);
         self.builder.program.current_region = statement.source_region;
+        var termination: StatementTermination = .none;
         const stmt: DraftStmt = switch (statement.data) {
             .pending,
             .import_,
@@ -24219,11 +24777,21 @@ const BodyContext = struct {
                     const unit_ty = try self.unitType();
                     break :blk .{ .expr = try self.addExpr(.{ .ty = unit_ty, .data = .unit }) };
                 }
-                break :blk try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region);
+                const lowered = try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region);
+                termination = lowered.termination;
+                break :blk lowered.stmt orelse return .{ .stmt = null, .termination = termination };
             },
-            .var_ => |decl| try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region),
+            .var_ => |decl| blk: {
+                const lowered = try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region);
+                termination = lowered.termination;
+                break :blk lowered.stmt orelse return .{ .stmt = null, .termination = termination };
+            },
             .var_uninitialized => |decl| .{ .uninitialized = try self.lowerUninitializedPatternStatement(decl.pattern) },
-            .reassign => |decl| try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region),
+            .reassign => |decl| blk: {
+                const lowered = try self.lowerPatternStatement(decl.pattern, decl.expr, statement.source_region);
+                termination = lowered.termination;
+                break :blk lowered.stmt orelse return .{ .stmt = null, .termination = termination };
+            },
             .crash => |msg| .{ .crash = try self.lowerStringLiteral(msg) },
             .dbg => |child| .{ .dbg = try self.lowerDbgMessage(child) },
             .expr => |child| try self.lowerExprStatement(child),
@@ -24309,7 +24877,13 @@ const BodyContext = struct {
             .break_ => .{ .expr = try self.breakCurrentLoopExpr() },
             .return_ => |ret| .{ .return_ = try self.lowerReturn(ret) },
         };
-        return try self.addStmt(stmt);
+        return .{
+            .stmt = try self.addStmt(stmt),
+            .termination = switch (termination) {
+                .none => if (self.checkedStatementDivergesInLoweredRuntime(statement_id)) .checked_control_transfer else .none,
+                else => termination,
+            },
+        };
     }
 
     fn lowerUninitializedPatternStatement(
@@ -24326,7 +24900,7 @@ const BodyContext = struct {
         pattern: checked.CheckedPatternId,
         expr: checked.CheckedExprId,
         source_region: base.Region,
-    ) Allocator.Error!DraftStmt {
+    ) Allocator.Error!LoweredPatternStatement {
         const value = try self.lowerExpr(expr);
         const value_ty = try self.exprType(value);
         const comptime_site = if (self.shouldRecordComptimeSite(.destructure) and self.patternCanMiss(pattern))
@@ -24334,11 +24908,11 @@ const BodyContext = struct {
         else
             null;
         if (!self.patternNeedsExplicitBinding(pattern)) {
-            return .{ .let_ = .{
+            return .{ .stmt = .{ .let_ = .{
                 .pat = try self.lowerPatternAtType(pattern, value_ty),
                 .value = value,
                 .comptime_site = comptime_site,
-            } };
+            } }, .termination = .none };
         }
 
         const unit_ty = try self.unitType();
@@ -24348,14 +24922,41 @@ const BodyContext = struct {
             try self.comptimeExhaustivenessFailedExpr(unit_ty, site)
         else
             try self.runtimeCrashExpr(unit_ty, "pattern match failed");
-        return .{ .expr = try self.lowerMaterializedPatternValueThen(
-            pattern,
-            value,
-            value_ty,
-            unit_ty,
-            .{ .expr = unit },
-            miss,
-        ) };
+        return .{
+            .stmt = .{ .expr = try self.lowerMaterializedPatternValueThen(
+                pattern,
+                value,
+                value_ty,
+                unit_ty,
+                .{ .expr = unit },
+                miss,
+            ) },
+            .termination = .none,
+        };
+    }
+
+    fn lowerUninhabitedScrutinee(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        return try self.lowerExprAtTypeWithDemand(expr_id, ty, .uninhabited_result);
+    }
+
+    fn lowerExplicitUninhabitedInvocation(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        return try self.zeroBranchMatch(try self.lowerUninhabitedScrutinee(expr_id, ty), ty);
+    }
+
+    fn zeroBranchMatch(self: *BodyContext, scrutinee: DraftExprId, ty: Type.TypeId) Allocator.Error!DraftExprId {
+        return try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
+            .scrutinee = scrutinee,
+            .branches = try self.addBranchSpan(&.{}),
+            .comptime_site = null,
+        } } });
     }
 
     fn registerLocalProc(self: *BodyContext, pattern_id: checked.CheckedPatternId) Allocator.Error!void {
@@ -24432,15 +25033,25 @@ const BodyContext = struct {
             .runtime_error,
             => Common.invariant("non-runtime checked pattern reached Monotype lowering"),
             .assign => |binder| blk: {
-                const local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), ty_cell, binder);
-                try self.bindLocalName(local, binder);
-                try self.binders.put(binder, local);
+                const local = if (self.reuse_pre_registered_pattern_binders)
+                    self.binders.get(binder) orelse Common.invariant("match pattern binder was not pre-registered before body lowering")
+                else local_blk: {
+                    const created = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), ty_cell, binder);
+                    try self.bindLocalName(created, binder);
+                    try self.binders.put(binder, created);
+                    break :local_blk created;
+                };
                 break :blk .{ .bind = local };
             },
             .as => |as| blk: {
-                const local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), ty_cell, as.binder);
-                try self.bindLocalName(local, as.binder);
-                try self.binders.put(as.binder, local);
+                const local = if (self.reuse_pre_registered_pattern_binders)
+                    self.binders.get(as.binder) orelse Common.invariant("match as-pattern binder was not pre-registered before body lowering")
+                else local_blk: {
+                    const created = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), ty_cell, as.binder);
+                    try self.bindLocalName(created, as.binder);
+                    try self.binders.put(as.binder, created);
+                    break :local_blk created;
+                };
                 break :blk .{ .as = .{
                     .pattern = try self.lowerPatternAtTypeCell(as.pattern, ty_cell, ty),
                     .local = local,

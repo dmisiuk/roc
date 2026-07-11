@@ -819,6 +819,7 @@ pub const EvidenceTargetInstantiation = union(enum(u8)) {
     callable: CheckedTypeId,
 };
 
+/// Exact checked target and nested evidence selected for one dispatch edge.
 pub const EvidenceNode = struct {
     target: MethodTarget,
     instantiation: EvidenceTargetInstantiation,

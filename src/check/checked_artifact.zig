@@ -3898,11 +3898,15 @@ pub const CheckedTypeStore = struct {
         try appendStaticDispatchTypeRoots(allocator, module, names, import_views, source_nodes, &store, &active);
 
         // Constraint evidence carries the exact discharged target
-        // instantiation. Include those fresh roots so every evidence node can
-        // directly reference its target type.
+        // instantiation. Every scheme-instantiation record can contribute a
+        // fresh constraint function to an evidence node: `value_use` records
+        // describe the outer site's evidence, while `dispatch_target` records
+        // describe a selected target's nested evidence. Include every fresh
+        // root so both levels can directly reference their checked callable.
         for (module_env.scheme_instantiations.items.items) |record| {
-            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.dispatch_target)) continue;
-            _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, @enumFromInt(record.slot_data));
+            if (record.slot_kind == @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.dispatch_target)) {
+                _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, @enumFromInt(record.slot_data));
+            }
             const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
             for (pairs) |pair| {
                 _ = try appendCheckedTypeRoot(allocator, module, names, import_views, &store, &active, @enumFromInt(pair.fresh_var));
@@ -7101,10 +7105,15 @@ test "checked type publication normalizes closed empty record backing" {
     try expectSingleNominalBackingPayload(std.testing.allocator, "Foo", "Foo := {}", .empty_record);
 }
 
+const EmptyTagCheckedOutputTestError = @import("test/TestEnv.zig").TestEnvError || error{
+    ExpectedFlexIdentity,
+    ExpectedFunctionPayload,
+};
+
 fn withEmptyTagCheckedOutputForTest(
     allocator: Allocator,
-    comptime inspect: fn (TypedCIR.Module, *canonical.CanonicalNameStore, CheckedImportViews, *CheckedTypeStore, *std.AutoHashMap(Var, CheckedTypeId), *types.Store, Var) anyerror!void,
-) !void {
+    comptime inspect: fn (TypedCIR.Module, *canonical.CanonicalNameStore, CheckedImportViews, *CheckedTypeStore, *std.AutoHashMap(Var, CheckedTypeId), *types.Store, Var) EmptyTagCheckedOutputTestError!void,
+) EmptyTagCheckedOutputTestError!void {
     const TestEnv = @import("test/TestEnv.zig");
 
     var test_env = try TestEnv.init("Main", "value = {}");
@@ -7137,8 +7146,7 @@ fn withEmptyTagCheckedOutputForTest(
 test "checked output preserves shared defaulted empty-tag identity" {
     const allocator = std.testing.allocator;
     try withEmptyTagCheckedOutputForTest(allocator, struct {
-        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
-            _ = explicit_empty;
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, _: Var) EmptyTagCheckedOutputTestError!void {
             const identity = try type_store.fresh();
             try type_store.setVarToEmptyTagUnionDefault(identity);
             const alias = try type_store.freshRedirect(identity);
@@ -7157,8 +7165,7 @@ test "checked output preserves shared defaulted empty-tag identity" {
 test "checked output preserves distinct defaulted empty-tag identities" {
     const allocator = std.testing.allocator;
     try withEmptyTagCheckedOutputForTest(allocator, struct {
-        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
-            _ = explicit_empty;
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, _: Var) EmptyTagCheckedOutputTestError!void {
             const first_identity = try type_store.fresh();
             const second_identity = try type_store.fresh();
             try type_store.setVarToEmptyTagUnionDefault(first_identity);
@@ -7180,7 +7187,7 @@ test "checked output preserves distinct defaulted empty-tag identities" {
 test "checked output keeps proven closed empty tag union explicit" {
     const allocator = std.testing.allocator;
     try withEmptyTagCheckedOutputForTest(allocator, struct {
-        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), _: *types.Store, explicit_empty: Var) !void {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), _: *types.Store, explicit_empty: Var) EmptyTagCheckedOutputTestError!void {
             const root = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, explicit_empty);
             try std.testing.expectEqual(CheckedTypePayload.empty_tag_union, store.payload(root));
         }
@@ -7190,7 +7197,7 @@ test "checked output keeps proven closed empty tag union explicit" {
 test "checked output keeps redirected proven empty tag union explicit" {
     const allocator = std.testing.allocator;
     try withEmptyTagCheckedOutputForTest(allocator, struct {
-        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) EmptyTagCheckedOutputTestError!void {
             const redirected = try type_store.freshRedirect(explicit_empty);
             const root = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, redirected);
             try std.testing.expectEqual(CheckedTypePayload.empty_tag_union, store.payload(root));
@@ -7201,8 +7208,7 @@ test "checked output keeps redirected proven empty tag union explicit" {
 test "checked output retains defaulted identity inside parent function digest" {
     const allocator = std.testing.allocator;
     try withEmptyTagCheckedOutputForTest(allocator, struct {
-        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, explicit_empty: Var) !void {
-            _ = explicit_empty;
+        fn inspect(module: TypedCIR.Module, names: *canonical.CanonicalNameStore, imports: CheckedImportViews, store: *CheckedTypeStore, active: *std.AutoHashMap(Var, CheckedTypeId), type_store: *types.Store, _: Var) EmptyTagCheckedOutputTestError!void {
             const identity = try type_store.fresh();
             try type_store.setVarToEmptyTagUnionDefault(identity);
             const function_content = try type_store.mkFuncPure(&.{identity}, identity);
@@ -12914,11 +12920,20 @@ fn isLocalProcExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
 /// bodies: `constraint(depth, k)` resolutions index the innermost enclosing
 /// scope's canonical evidence params at depth 0, walking outward to the
 /// template's own params.
-const RefScopeRecord = struct {
+pub const DispatchRefScope = struct {
     /// Enclosing scope id, or `ref_scope_root` for the template itself.
     parent: u32,
     /// The local function's scheme root var (its decl pattern var).
     scheme_var: Var,
+    /// Checked local-function expression that owns this scope.
+    checked_expr: CheckedExprId,
+};
+
+/// Checked relation shape Monotype must instantiate before specializing the
+/// scope that owns a dispatch reference.
+pub const DispatchRelationKind = enum(u8) {
+    callable_result,
+    conversion,
 };
 
 /// Sentinel scope id: the template's own evidence params.
@@ -12933,7 +12948,7 @@ const TemplateIteratorRefs = struct {
     spans: []artifact_serialize.Span = &.{},
     pool: []static_dispatch.IteratorForPlanId = &.{},
     /// Generalized-local-function scopes, pooled across templates.
-    scopes: []RefScopeRecord = &.{},
+    scopes: []DispatchRefScope = &.{},
     /// Scope of each collected dispatch plan ref (parallel to
     /// `StaticDispatchPlanTable.template_refs`).
     plan_scopes: []u32 = &.{},
@@ -12971,10 +12986,6 @@ fn sealCheckedProcedureTemplateRefs(
     defer local_schemes.deinit();
     {
         const types_store = module.typeStoreConst();
-        var enum_scratch = dispatch_evidence.Scratch{};
-        defer enum_scratch.deinit(allocator);
-        var params = std.ArrayListUnmanaged(dispatch_evidence.EvidenceParam).empty;
-        defer params.deinit(allocator);
 
         var raw_node: u32 = 0;
         while (raw_node < module.nodeCount()) : (raw_node += 1) {
@@ -12990,9 +13001,6 @@ fn sealCheckedProcedureTemplateRefs(
             }
             const pattern_var = ModuleEnv.varFrom(decl.pattern);
             if (types_store.resolveVar(pattern_var).desc.rank != .generalized) continue;
-            params.clearRetainingCapacity();
-            try dispatch_evidence.enumerateEvidenceParams(allocator, types_store, pattern_var, &enum_scratch, &params);
-            if (params.items.len == 0) continue;
             const checked_expr = checked_bodies.exprIdForSource(decl.expr) orelse continue;
             try local_schemes.put(@intFromEnum(checked_expr), pattern_var);
         }
@@ -13015,6 +13023,8 @@ fn sealCheckedProcedureTemplateRefs(
     errdefer value_ref_scope_pool.deinit(allocator);
     var dispatch_ref_scope_pool = std.ArrayList(u32).empty;
     errdefer dispatch_ref_scope_pool.deinit(allocator);
+    var dispatch_relation_kind_pool = std.ArrayList(DispatchRelationKind).empty;
+    errdefer dispatch_relation_kind_pool.deinit(allocator);
     var iterator_scope_pool = std.ArrayList(u32).empty;
     errdefer iterator_scope_pool.deinit(allocator);
     const iterator_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.len);
@@ -13037,6 +13047,15 @@ fn sealCheckedProcedureTemplateRefs(
 
         template.resolved_value_refs = try artifact_serialize.appendSpan(ResolvedValueRefTableRef, ResolvedValueRefId, &value_ref_pool, allocator, collector.value_refs.items);
         template.static_dispatch_plans = try artifact_serialize.appendSpan(@TypeOf(template.static_dispatch_plans), static_dispatch.StaticDispatchPlanId, &dispatch_ref_pool, allocator, collector.dispatch_refs.items);
+        for (collector.dispatch_refs.items) |plan_id| {
+            const plan = static_dispatch_plans.plans[@intFromEnum(plan_id)];
+            var kind: DispatchRelationKind = .callable_result;
+            for (plan.argsSlice(static_dispatch_plans)) |operand| switch (operand) {
+                .generated_numeral, .generated_quote => kind = .conversion,
+                .checked_expr, .generated_interpolation_iter => {},
+            };
+            try dispatch_relation_kind_pool.append(allocator, kind);
+        }
         iterator_spans[template_index] = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.IteratorForPlanId, &iterator_ref_pool, allocator, collector.iterator_refs.items);
         try value_ref_scope_pool.appendSlice(allocator, collector.value_ref_scopes.items);
         try dispatch_ref_scope_pool.appendSlice(allocator, collector.dispatch_ref_scopes.items);
@@ -13045,10 +13064,13 @@ fn sealCheckedProcedureTemplateRefs(
 
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
     static_dispatch_plans.template_refs = try dispatch_ref_pool.toOwnedSlice(allocator);
+    templates.dispatch_ref_scopes = try allocator.dupe(u32, dispatch_ref_scope_pool.items);
+    templates.dispatch_relation_kinds = try dispatch_relation_kind_pool.toOwnedSlice(allocator);
+    templates.dispatch_scopes = try allocator.dupe(DispatchRefScope, collector.scopes.items);
     template_iterator_refs.* = .{
         .spans = iterator_spans,
         .pool = try iterator_ref_pool.toOwnedSlice(allocator),
-        .scopes = try allocator.dupe(RefScopeRecord, collector.scopes.items),
+        .scopes = try allocator.dupe(DispatchRefScope, collector.scopes.items),
         .plan_scopes = try dispatch_ref_scope_pool.toOwnedSlice(allocator),
         .value_ref_scopes = try value_ref_scope_pool.toOwnedSlice(allocator),
         .iterator_scopes = try iterator_scope_pool.toOwnedSlice(allocator),
@@ -13790,7 +13812,7 @@ const EvidencePass = struct {
         // all are intrinsically monomorphic.
         const instantiation: static_dispatch.EvidenceTargetInstantiation = if (constraint_fn_var) |fn_var| .{
             .callable = self.checked_types.rootForSourceVar(self.module, fn_var) orelse
-                checkedArtifactInvariant("dispatch target callable was missing from checked type output", .{}),
+                checkedArtifactInvariant("dispatch target callable {d} was missing from checked type output", .{@intFromEnum(self.types.resolveVar(fn_var).var_)}),
         } else .monomorphic;
         const node_id: static_dispatch.EvidenceNodeId = @enumFromInt(@as(u32, @intCast(self.evidence_nodes.items.len)));
         try self.evidence_nodes.append(self.allocator, .{ .target = target, .instantiation = instantiation });
@@ -14072,7 +14094,7 @@ const CheckedTemplateRefCollector = struct {
     dispatch_ref_scopes: std.ArrayList(u32),
     iterator_ref_scopes: std.ArrayList(u32),
     /// Pooled across templates (ids are global); the stack resets per template.
-    scopes: std.ArrayList(RefScopeRecord),
+    scopes: std.ArrayList(DispatchRefScope),
     scope_stack: std.ArrayList(u32),
     visited_exprs: std.AutoHashMap(CheckedExprId, void),
     visited_patterns: std.AutoHashMap(CheckedPatternId, void),
@@ -14390,7 +14412,7 @@ const CheckedTemplateRefCollector = struct {
                     // plans and refs inside its body resolve against its own
                     // evidence params at depth 0.
                     const scope_id: u32 = @intCast(self.scopes.items.len);
-                    try self.scopes.append(self.allocator, .{ .parent = self.currentScope(), .scheme_var = scheme_var });
+                    try self.scopes.append(self.allocator, .{ .parent = self.currentScope(), .scheme_var = scheme_var, .checked_expr = decl.expr });
                     try self.scope_stack.append(self.allocator, scope_id);
                     defer _ = self.scope_stack.pop();
                     try self.collectExpr(decl.expr);
@@ -14593,12 +14615,21 @@ pub const CheckedProcedureTemplateTable = struct {
     evidence_params_pool: []static_dispatch.EvidenceParamRecord = &.{},
     /// Flat pool backing each evidence param's `path` span.
     evidence_param_paths: []static_dispatch.EvidencePathStep = &.{},
+    /// Scope of each `StaticDispatchPlanTable.template_refs` entry.
+    dispatch_ref_scopes: []u32 = &.{},
+    /// Relation semantics of each `StaticDispatchPlanTable.template_refs` entry.
+    dispatch_relation_kinds: []DispatchRelationKind = &.{},
+    /// Generalized-local scopes referenced by `dispatch_ref_scopes`.
+    dispatch_scopes: []DispatchRefScope = &.{},
 
     pub const Serialized = extern struct {
         templates: SerializedSlice(CheckedProcedureTemplate) = .{},
         by_def: SerializedSlice(static_dispatch.ProcedureTemplateLookupEntry) = .{},
         evidence_params_pool: SerializedSlice(static_dispatch.EvidenceParamRecord) = .{},
         evidence_param_paths: SerializedSlice(static_dispatch.EvidencePathStep) = .{},
+        dispatch_ref_scopes: SerializedSlice(u32) = .{},
+        dispatch_relation_kinds: SerializedSlice(DispatchRelationKind) = .{},
+        dispatch_scopes: SerializedSlice(DispatchRefScope) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CheckedProcedureTemplateTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -14814,6 +14845,9 @@ pub const CheckedProcedureTemplateTable = struct {
         allocator.free(self.templates);
         allocator.free(self.evidence_params_pool);
         allocator.free(self.evidence_param_paths);
+        allocator.free(self.dispatch_ref_scopes);
+        allocator.free(self.dispatch_relation_kinds);
+        allocator.free(self.dispatch_scopes);
         self.* = .{};
     }
 
@@ -26116,7 +26150,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 193);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 196);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording

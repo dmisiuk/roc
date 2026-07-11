@@ -144,19 +144,21 @@ pub const ConstCapture = struct {
     value: ConstNodeId,
 };
 
-/// Dispatch evidence selected for a stored compile-time function value. Target
-/// module identities make every checked id explicitly relative to its owning
-/// checked module when the function is restored in another compilation.
+/// Flattened child-vector bounds for one stored target evidence node.
 pub const ConstFnNestedEvidence = struct {
     count: u32,
     subtree_len: u32,
 };
 
+/// Exact checked callable relation attached to a stored target edge.
 pub const ConstFnCallableInstantiation = struct {
     view: names.CheckedModuleDigest,
     callable_ty: checked_ids.CheckedTypeId,
 };
 
+/// Dispatch evidence selected for a stored compile-time function value. Target
+/// module identities make every checked id explicitly relative to its owning
+/// checked module when the function is restored in another compilation.
 pub const ConstFnEvidence = union(enum) {
     target: struct {
         view: names.CheckedModuleDigest,
