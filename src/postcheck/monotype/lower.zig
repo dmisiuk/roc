@@ -432,6 +432,11 @@ const LoweredCall = struct {
     data: DraftExprData,
 };
 
+const LoweringDemand = enum {
+    runtime_value,
+    inspect_only,
+};
+
 const ParseIntrinsic = enum {
     tag_union_parse,
     fields_rename_fields,
@@ -8454,17 +8459,6 @@ const BodyContext = struct {
             }
         }
 
-        for (arg_tys) |arg_ty| {
-            if (self.typeIsClosedEmptyTagUnion(arg_ty)) {
-                const body = try self.runtimeCrashExpr(ret_ty, "called function with an uninhabited argument");
-                return .{
-                    .args = try self.addTypedLocalSpan(args),
-                    .body = body,
-                    .ret = try self.draftTypeCell(ret_ty),
-                };
-            }
-        }
-
         var body = try self.lowerBindingContinuation(.{ .materialized_args = .{
             .args = materialized_args.items,
             .index = 0,
@@ -8611,6 +8605,11 @@ const BodyContext = struct {
         const region = self.sourceRegionForExpr(expr);
         self.builder.program.current_loc = try self.sourceLocFor(region);
         self.builder.program.current_region = region;
+        switch (expr.data) {
+            .call => |call| if (try self.lowerInspectOnlyCall(expr.ty, call, try self.builder.primitiveType(.str))) |rendered| return rendered,
+            else => {},
+        }
+        self.requireLowerableNode(expr, try self.lowerExprTypeNode(expr_id), .runtime_value);
         switch (expr.data) {
             .call => |call| {
                 if (self.view.hoisted_constants.lookupByExpr(expr_id) != null) {
@@ -8869,6 +8868,33 @@ const BodyContext = struct {
             .run_low_level => |low_level| .{ .low_level = .{ .op = low_level.op, .args = try self.lowerExprSpan(low_level.args) } },
         };
         return try self.addExpr(.{ .ty = ty, .data = data });
+    }
+
+    fn requireLowerableNode(
+        self: *BodyContext,
+        expr: checked.CheckedExpr,
+        node: NodeId,
+        demand: LoweringDemand,
+    ) void {
+        if (demand == .inspect_only) return;
+        if (!self.nodeIsClosedEmptyTagUnion(node)) return;
+        switch (expr.data) {
+            .runtime_error, .crash, .ellipsis => {},
+            else => Common.invariant("runtime-value demand reached a checked expression with closed empty tag-union type"),
+        }
+    }
+
+    fn nodeIsClosedEmptyTagUnion(self: *BodyContext, node: NodeId) bool {
+        var current = node;
+        var remaining = self.graph.nodes.items.len;
+        while (remaining > 0) : (remaining -= 1) {
+            switch (self.graph.content(current)) {
+                .empty_tag_union => return true,
+                .named => |named| current = (named.backing orelse return false).node,
+                else => return false,
+            }
+        }
+        Common.invariant("named Monotype backing cycle reached runtime-value constructibility check");
     }
 
     fn lowerDbgMessage(self: *BodyContext, child: checked.CheckedExprId) Allocator.Error!DraftExprId {
@@ -9213,6 +9239,79 @@ const BodyContext = struct {
         try body_ctx.constrainKnownType(root.checked_type, mono_fn_ty);
 
         return try body_ctx.lowerComptimeRootExprAtType(wrapper.body_expr, mono_fn_ty);
+    }
+
+    fn lowerInspectOnlyCall(
+        self: *BodyContext,
+        checked_ret_ty: checked.CheckedTypeId,
+        call: anytype,
+        str_ty: Type.TypeId,
+    ) Allocator.Error!?DraftExprId {
+        const target = call.direct_target orelse return null;
+        if (!self.resolvedTargetIsStrInspect(target)) return null;
+        if (call.args.len != 1) Common.invariant("Str.inspect call did not have exactly one argument");
+
+        const value_node = try self.lowerExprTypeNode(call.args[0]);
+        switch (self.graph.content(value_node)) {
+            .func, .erased => {},
+            else => return null,
+        }
+
+        try self.constrainTypeToMono(checked_ret_ty, str_ty);
+        self.requireLowerableNode(self.view.bodies.expr(call.args[0]), value_node, .inspect_only);
+        return try self.stringExpr("<function>", str_ty);
+    }
+
+    fn resolvedTargetIsStrInspect(self: *BodyContext, target: checked.ResolvedValueId) bool {
+        const raw = @intFromEnum(target);
+        if (raw >= self.view.resolved_refs.records.len) {
+            Common.invariant("checked direct call target is outside resolved value table");
+        }
+        return switch (self.view.resolved_refs.records[raw].ref) {
+            .top_level_proc,
+            .imported_proc,
+            .hosted_proc,
+            .promoted_top_level_proc,
+            => |proc| self.procedureUseIsStrInspect(proc),
+            .platform_required_proc => |proc| self.procedureUseIsStrInspect(proc.procedure),
+            else => false,
+        };
+    }
+
+    fn procedureUseIsStrInspect(self: *BodyContext, proc: checked.ProcedureUseTemplate) bool {
+        return switch (proc.binding) {
+            .top_level => |top_level| blk: {
+                const view = self.builder.moduleForId(checked.topLevelProcedureModuleId(top_level));
+                const binding = view.top_level_procedure_bindings.get(top_level.binding);
+                break :blk self.procedureBindingBodyIsStrInspect(view, binding.body);
+            },
+            .imported => |imported| blk: {
+                const view = self.builder.moduleForId(checked.importedProcedureModuleId(imported));
+                for (view.exported_procedure_bindings.bindings) |binding| {
+                    if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
+                        break :blk self.procedureBindingBodyIsStrInspect(view, binding.body);
+                    }
+                }
+                Common.invariant("imported procedure binding was not exported by its checked module");
+            },
+            .hosted, .platform_required => false,
+        };
+    }
+
+    fn procedureBindingBodyIsStrInspect(_: *BodyContext, view: ModuleView, body: anytype) bool {
+        const template_ref = switch (body) {
+            .direct_template => |direct| switch (direct.template) {
+                .checked => |template| template,
+                .lifted, .synthetic => return false,
+            },
+            .callable_eval_template => return false,
+        };
+        const template = view.templates.get(template_ref.template);
+        const wrapper_id = switch (template.body) {
+            .intrinsic_wrapper => |wrapper| wrapper,
+            else => return false,
+        };
+        return view.intrinsic_wrappers.get(wrapper_id).intrinsic == .str_inspect;
     }
 
     fn parseIntrinsicForResolvedTarget(self: *BodyContext, target: checked.ResolvedValueId) ?ParseIntrinsic {
@@ -16286,6 +16385,11 @@ const BodyContext = struct {
         const region = self.sourceRegionForExpr(expr);
         self.builder.program.current_loc = try self.sourceLocFor(region);
         self.builder.program.current_region = region;
+        switch (expr.data) {
+            .call => |call| if (try self.lowerInspectOnlyCall(expr.ty, call, ty)) |rendered| return rendered,
+            else => {},
+        }
+        self.requireLowerableNode(expr, try self.activeNodeFromType(ty), .runtime_value);
         if (try self.restoredHoistedExprAtType(checked_expr, ty)) |restored| return restored;
         switch (expr.data) {
             .call => |call| {

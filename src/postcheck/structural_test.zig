@@ -343,6 +343,11 @@ test "Monotype active view materialization rejects unresolved rows" {
     try expectContains(solve_source, "active Monotype view requested for unresolved instantiation node");
 }
 
+test "Postcheck does not synthesize runtime crash for uninhabited lambda arguments" {
+    const lower_source = @embedFile("monotype/lower.zig");
+    try expectNotContains(lower_source, "called function with an uninhabited argument");
+}
+
 test "Lambda Mono consumes Lambda Solved through a read-only view" {
     const solved_ast_source = @embedFile("lambda_solved/ast.zig");
     try expectContains(solved_ast_source, "pub const ProgramView = struct");
