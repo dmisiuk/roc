@@ -326,6 +326,23 @@ test "Lambda Solved unify does not yield explicit empty tag unions" {
     try expectNotContains(solve_source, "fn isEmptyTagUnion");
 }
 
+test "Monotype lowering does not use unsolved_monos side table" {
+    const lower_source = @embedFile("monotype/lower.zig");
+    const solve_source = @embedFile("monotype/solve.zig");
+    try expectNotContains(lower_source, "unsolved_monos");
+    try expectNotContains(solve_source, "unsolved_monos");
+}
+
+test "Monotype instantiation does not reopen empty tag union views" {
+    const solve_source = @embedFile("monotype/solve.zig");
+    try expectNotContains(solve_source, "reopenUnsolvedEmptyTagUnionView");
+}
+
+test "Monotype active view materialization rejects unresolved rows" {
+    const solve_source = @embedFile("monotype/solve.zig");
+    try expectContains(solve_source, "active Monotype view requested for unresolved instantiation node");
+}
+
 test "Lambda Mono consumes Lambda Solved through a read-only view" {
     const solved_ast_source = @embedFile("lambda_solved/ast.zig");
     try expectContains(solved_ast_source, "pub const ProgramView = struct");

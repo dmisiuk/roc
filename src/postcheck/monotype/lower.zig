@@ -551,11 +551,6 @@ const Builder = struct {
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     spec_store: specialize.SpecBuilder,
-    /// TypeIds whose zero-tag union content has explicit unsolved-row
-    /// provenance. Builder-global cached Monotypes enter here when lowered
-    /// without body evidence; graph-backed views enter when sealed before
-    /// another specialization consumes their final evidence.
-    unsolved_monos: std.AutoHashMap(Type.TypeId, void),
     lowered_templates: std.AutoHashMap(Ast.FnId, LoweredTemplate),
     /// Nested-fn specialization records keyed by function id; the durable
     /// identity and status live on the `Ast.SpecRecord`.
@@ -605,7 +600,6 @@ const Builder = struct {
             .inline_expects = options.inline_expects,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
             .spec_store = spec_store,
-            .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
             .lowered_nested_by_fn = std.AutoHashMap(Ast.FnId, Ast.SpecId).init(allocator),
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
@@ -650,7 +644,6 @@ const Builder = struct {
         self.lowered_nested_by_fn.deinit();
         self.lowered_templates.deinit();
         self.spec_store.deinit();
-        self.unsolved_monos.deinit();
         self.type_cache.deinit();
         self.evidence_arena.deinit();
     }
@@ -1189,7 +1182,7 @@ const Builder = struct {
             wrapper_fn_ty,
         );
 
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -1435,7 +1428,7 @@ const Builder = struct {
             => {},
         }
 
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -1496,9 +1489,6 @@ const Builder = struct {
         body_ctx.owner_context_fn_key = root_fn_key;
         body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
-        if (requester) |requester_graph| {
-            try self.markGraphBackedUnsolvedRows(requester_graph, lower_fn_ty);
-        }
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
 
@@ -1509,14 +1499,12 @@ const Builder = struct {
         // requester's id in place. Builder-global types stay snapshots; they
         // serve many specializations.
         const root_node = try body_ctx.instNode(template.checked_fn_root);
-        const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(lower_fn_ty) and body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
-        if (!self.unsolved_monos.contains(lower_fn_ty) and !body_uses_generated_evidence) {
+        const body_uses_generated_evidence = body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
+        if (!body_uses_generated_evidence) {
             try graph.addMonoView(root_node, lower_fn_ty);
         }
         const draft = FinalBodyOutputGuard.begin(self);
         const live_fn_ty = try body_ctx.activeTypeFromNode(root_node);
-        try self.markGraphBackedUnsolvedRows(graph, live_fn_ty);
         const body_fn_ty = if (body_uses_generated_evidence) lower_fn_ty else live_fn_ty;
         const lowered = try body_ctx.lowerTemplateBody(template_ref, template, body_fn_ty);
         const draft_end = draft.end(self);
@@ -1819,7 +1807,6 @@ const Builder = struct {
 
             fn fill(context: @This(), reserved: Type.TypeId) Allocator.Error!Type.Content {
                 try context.builder.type_cache.put(context.address, reserved);
-                try context.builder.unsolved_monos.put(reserved, {});
                 return try context.builder.lowerTypePayload(context.view, context.checked_ty, context.view.types.payload(context.checked_ty));
             }
         };
@@ -2156,7 +2143,6 @@ const Builder = struct {
         graph: *InstGraph,
         fn_ty: Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        try self.markGraphBackedUnsolvedRows(graph, fn_ty);
         if (!try self.monoTypeHasGeneratedOpaqueEvidence(fn_ty)) return fn_ty;
         try graph.drainDirty();
         var sealer = GraphTypeFinals.init(graph);
@@ -2164,92 +2150,6 @@ const Builder = struct {
         const sealed = try sealer.sealType(fn_ty);
         try graph.assertTypeHasNoGraphViews(sealed);
         return sealed;
-    }
-
-    fn markGraphBackedUnsolvedRows(
-        self: *Builder,
-        graph: *InstGraph,
-        ty: Type.TypeId,
-    ) Allocator.Error!void {
-        var seen = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
-        defer seen.deinit();
-        try self.markGraphBackedUnsolvedRowsInner(graph, ty, &seen);
-    }
-
-    fn markGraphBackedUnsolvedRowsInner(
-        self: *Builder,
-        graph: *InstGraph,
-        ty: Type.TypeId,
-        seen: *std.AutoHashMap(Type.TypeId, void),
-    ) Allocator.Error!void {
-        const seen_entry = try seen.getOrPut(ty);
-        if (seen_entry.found_existing) return;
-
-        const content = self.program.types.get(ty);
-        switch (content) {
-            .tag_union => |tags| {
-                const tag_span = self.program.types.tagSpan(tags);
-                if (tag_span.len == 0) {
-                    if (graph.monoViewNode(ty) != null) {
-                        try self.unsolved_monos.put(ty, {});
-                    }
-                }
-                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
-                    const tag = GuardedList.at(tag_span, tag_index);
-                    const payloads = self.program.types.span(tag.payloads);
-                    for (0..GuardedList.borrowLen(payloads)) |payload_index| {
-                        const payload = GuardedList.at(payloads, payload_index);
-                        try self.markGraphBackedUnsolvedRowsInner(graph, payload, seen);
-                    }
-                }
-            },
-            .record => |fields| {
-                const field_span = self.program.types.fieldSpan(fields);
-                for (0..GuardedList.borrowLen(field_span)) |field_index| {
-                    const field = GuardedList.at(field_span, field_index);
-                    try self.markGraphBackedUnsolvedRowsInner(graph, field.ty, seen);
-                }
-            },
-            .tuple => |items| {
-                const item_span = self.program.types.span(items);
-                for (0..GuardedList.borrowLen(item_span)) |item_index| {
-                    const item = GuardedList.at(item_span, item_index);
-                    try self.markGraphBackedUnsolvedRowsInner(graph, item, seen);
-                }
-            },
-            .list => |elem| try self.markGraphBackedUnsolvedRowsInner(graph, elem, seen),
-            .box => |elem| try self.markGraphBackedUnsolvedRowsInner(graph, elem, seen),
-            .func => |function| {
-                const args = self.program.types.span(function.args);
-                for (0..GuardedList.borrowLen(args)) |arg_index| {
-                    const arg = GuardedList.at(args, arg_index);
-                    try self.markGraphBackedUnsolvedRowsInner(graph, arg, seen);
-                }
-                try self.markGraphBackedUnsolvedRowsInner(graph, function.ret, seen);
-            },
-            .named => |named| {
-                const args = self.program.types.span(named.args);
-                for (0..GuardedList.borrowLen(args)) |arg_index| {
-                    const arg = GuardedList.at(args, arg_index);
-                    try self.markGraphBackedUnsolvedRowsInner(graph, arg, seen);
-                }
-                if (named.backing) |backing| {
-                    try self.markGraphBackedUnsolvedRowsInner(graph, backing.ty, seen);
-                }
-                const declared_fields = self.program.types.declaredFieldSpan(named.declared_order);
-                for (0..GuardedList.borrowLen(declared_fields)) |field_index| {
-                    const field = GuardedList.at(declared_fields, field_index);
-                    switch (field) {
-                        .named => {},
-                        .padding => |padding| try self.markGraphBackedUnsolvedRowsInner(graph, padding, seen),
-                    }
-                }
-            },
-            .primitive,
-            .erased,
-            .zst,
-            => {},
-        }
     }
 
     fn functionShape(self: *Builder, ty: Type.TypeId, comptime message: []const u8) FunctionShape {
@@ -2293,7 +2193,7 @@ const Builder = struct {
         nominal: checked.CheckedNominalType,
         mono_args: []const Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -2816,7 +2716,7 @@ const Builder = struct {
         switch (fn_template.fn_def) {
             .nested => {
                 const fn_view = self.moduleForConstFnDef(fn_template.fn_def);
-                const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+                const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
                 defer graph.destroy();
                 const saved_graph = self.active_graph;
                 self.active_graph = graph;
@@ -2995,13 +2895,12 @@ const Builder = struct {
         try request.ctx.constrainTypeToMono(fn_template.source_fn_ty, public_constraint_fn_ty);
 
         const root_node = try request.ctx.instNode(fn_template.source_fn_ty);
-        const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(fn_template.mono_fn_ty) and request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
+        const body_uses_generated_evidence = request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
         if (!body_uses_generated_evidence) {
             if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
                 try request.ctx.graph.unify(root_node, request_node);
                 try request.ctx.graph.drainDirty();
-            } else if (!self.unsolved_monos.contains(fn_template.mono_fn_ty)) {
+            } else {
                 try request.ctx.graph.addMonoView(root_node, fn_template.mono_fn_ty);
             }
         }
@@ -3801,7 +3700,7 @@ const Builder = struct {
         }
 
         const fn_view = self.moduleForConstFnDef(fn_value.fn_def);
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -3928,7 +3827,7 @@ const Builder = struct {
             else => Common.invariant("non-parser function reached parser runtime restore"),
         };
         const fn_view = self.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -4036,7 +3935,7 @@ const Builder = struct {
             else => Common.invariant("non-encoder_for function reached encoder_for runtime restore"),
         };
         const fn_view = self.moduleForDigest(names.procTemplateModuleDigest(runtime.owner));
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -4431,7 +4330,7 @@ const Builder = struct {
         };
         const template = procedure.template;
 
-        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names, &self.unsolved_monos);
+        const graph = try InstGraph.create(self.allocator, &self.program.types, &self.program.names);
         defer graph.destroy();
         const saved_graph = self.active_graph;
         self.active_graph = graph;
@@ -8003,9 +7902,6 @@ const BodyContext = struct {
     }
 
     fn activeNodeFromType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!NodeId {
-        if (self.builder.unsolved_monos.contains(ty)) {
-            if (try self.graph.reopenUnsolvedEmptyTagUnionView(ty)) |node| return node;
-        }
         if (self.graph.monoViewNode(ty)) |node| return node;
         return try self.graph.importMono(ty);
     }
@@ -15302,9 +15198,7 @@ const BodyContext = struct {
         try body_ctx.constrainTypeToMono(body.checked_type, ty);
 
         const result_node = try body_ctx.instNode(body.checked_type);
-        if (!self.builder.unsolved_monos.contains(ty)) {
-            try self.graph.addMonoView(result_node, ty);
-        }
+        try self.graph.addMonoView(result_node, ty);
         const live_ty = try self.activeTypeFromNode(result_node);
         const lowered = try body_ctx.lowerComptimeRootExprAtType(body.body_expr, live_ty);
         return lowered;
@@ -17941,7 +17835,7 @@ const BodyContext = struct {
         arg_index: usize,
         arg_ty: Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        var graph = try InstGraph.create(self.allocator, &self.builder.program.types, &self.builder.program.names, &self.builder.unsolved_monos);
+        var graph = try InstGraph.create(self.allocator, &self.builder.program.types, &self.builder.program.names);
         defer graph.destroy();
 
         const owner_template = switch (lookup.target.kind) {
@@ -25636,10 +25530,7 @@ test "draft type cell seals graph nodes into closed monotypes" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const node = try graph.newNode(.{ .primitive = .u64 });
@@ -25663,10 +25554,7 @@ test "draft sealed type cell validation distinguishes closed snapshots from grap
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const closed = try type_store.add(.{ .primitive = .u64 });
@@ -25693,10 +25581,7 @@ test "body draft store appends draft-local ids spans and type cells" {
     var program = Ast.Program.init(gpa);
     defer program.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &program.types, &program.names, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &program.types, &program.names);
     defer graph.destroy();
 
     var draft = BodyDraftStore.init(gpa);
@@ -25878,10 +25763,7 @@ test "body draft sealed output maps back from specialization cache without body 
     var program = Ast.Program.init(gpa);
     defer program.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &program.types, &program.names, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &program.types, &program.names);
     defer graph.destroy();
 
     var draft = BodyDraftStore.init(gpa);

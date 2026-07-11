@@ -208,7 +208,7 @@ const NominalBackingCacheContext = struct {
 
 /// Per-specialization type solver. Checked types instantiate into union-find
 /// nodes with explicit row extension links; constraints unify nodes
-/// order-independently; Monotypes are materialized views of solved nodes and
+/// order-independently; Monotypes are materialized views of resolved nodes and
 /// are refilled in place when their node gains evidence. Cross-specialization
 /// edges import final Monotypes as closed structure, so a specialization that
 /// tries to exceed its requested type is a unification conflict, not a silent
@@ -217,11 +217,6 @@ pub const InstGraph = struct {
     allocator: Allocator,
     types: *Type.Store,
     name_store: *const names.NameStore,
-    /// Provenance for TypeIds whose zero-tag union content is an unsolved row
-    /// slot, not an explicit/proven `[]`. This includes builder-global cached
-    /// Monotypes lowered without body evidence and graph-backed views marked
-    /// before another specialization consumes them.
-    unsolved_monos: *const std.AutoHashMap(Type.TypeId, void),
     arena_impl: std.heap.ArenaAllocator,
     nodes: std.ArrayList(InstNode),
     versions: std.ArrayList(u32),
@@ -259,14 +254,12 @@ pub const InstGraph = struct {
         allocator: Allocator,
         types: *Type.Store,
         name_store: *const names.NameStore,
-        unsolved_monos: *const std.AutoHashMap(Type.TypeId, void),
     ) Allocator.Error!*InstGraph {
         const graph = try allocator.create(InstGraph);
         graph.* = .{
             .allocator = allocator,
             .types = types,
             .name_store = name_store,
-            .unsolved_monos = unsolved_monos,
             .arena_impl = std.heap.ArenaAllocator.init(allocator),
             .nodes = .empty,
             .versions = .empty,
@@ -1282,13 +1275,7 @@ pub const InstGraph = struct {
             } },
             .tag_union => |tags| blk: {
                 const span = types.tagSpan(tags);
-                // Only TypeIds marked with unsolved-row provenance may re-enter
-                // as row evidence. An ordinary finished zero-tag union is
-                // explicit/proven `[]`.
                 if (span.len == 0) {
-                    if (self.unsolved_monos.contains(ty)) {
-                        break :blk .{ .unresolved = InstVariable.row(.empty_tag_union) };
-                    }
                     break :blk .empty_tag_union;
                 }
                 const inst_tags = try self.arena().alloc(InstTag, span.len);
@@ -1532,21 +1519,6 @@ pub const InstGraph = struct {
         return null;
     }
 
-    /// Reopen a graph view whose TypeId was already checked against
-    /// `unsolved_monos`. Sealing can materialize an unresolved row slot as
-    /// closed `[]` before later graph evidence reaches it; this converts only
-    /// those marked views back into unresolved row evidence and queues the
-    /// normal dirty propagation through `setContent`. Ordinary unmarked `[]`
-    /// TypeIds must stay closed and never use this path.
-    pub fn reopenUnsolvedEmptyTagUnionView(self: *InstGraph, ty: Type.TypeId) Allocator.Error!?NodeId {
-        const node = self.monoViewNode(ty) orelse return null;
-        switch (self.nodes.items[@intFromEnum(node)]) {
-            .empty_tag_union => try self.setContent(node, .{ .unresolved = InstVariable.checkedVariable(null, .empty_tag_union) }),
-            else => {},
-        }
-        return node;
-    }
-
     /// Write a node's current content into one of its Monotype views.
     fn fillMono(self: *InstGraph, raw_root: NodeId, ty: Type.TypeId) Allocator.Error!void {
         const root = self.find(raw_root);
@@ -1554,7 +1526,7 @@ pub const InstGraph = struct {
         const previous = types.get(ty);
         const filled: Type.Content = switch (self.nodes.items[@intFromEnum(root)]) {
             .redirect => unreachable,
-            .unresolved => |variable| materializeUnresolved(variable),
+            .unresolved => Common.invariant("active Monotype view requested for unresolved instantiation node"),
             .primitive => |primitive| .{ .primitive = primitive },
             .list => |elem| .{ .list = try self.monoForWithReuse(elem, switch (previous) {
                 .list => |old| old,
@@ -2329,10 +2301,7 @@ test "issue 9647: row refills do not duplicate dependencies or materialized span
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const field_name = try name_store.internRecordFieldLabel("value");
@@ -2366,10 +2335,7 @@ test "record field node carries contextual row evidence into receiver" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const field_name = try name_store.internRecordFieldLabel("shout!");
@@ -2428,10 +2394,7 @@ test "alias unification does not make the alias its own backing" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const backing = try graph.newNode(.{ .primitive = .u64 });
@@ -2465,10 +2428,7 @@ test "sealed monotype copy is not refilled by later graph evidence" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const a_name = try name_store.internRecordFieldLabel("a");
@@ -2514,10 +2474,7 @@ test "sealed graph function copy recursively seals graph-owned argument views" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const a_name = try name_store.internRecordFieldLabel("a");
@@ -2572,10 +2529,7 @@ test "sealed graph node does not allocate a mutable monotype view" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const a_name = try name_store.internRecordFieldLabel("a");
@@ -2607,7 +2561,7 @@ test "sealed graph node does not allocate a mutable monotype view" {
     try std.testing.expectEqual(@as(usize, 1), type_store.fieldSpan(type_store.get(sealed).record).len);
 }
 
-test "unconstrained checked graph node seals to empty tag union" {
+test "unresolved row graph node seals to closed empty tag union only at finalization" {
     const gpa = std.testing.allocator;
 
     var type_store = Type.Store.init(gpa);
@@ -2616,15 +2570,13 @@ test "unconstrained checked graph node seals to empty tag union" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
-    const node = try graph.newNode(.{ .unresolved = InstVariable.checkedVariable(null, null) });
+    const node = try graph.newNode(.{ .unresolved = InstVariable.row(.empty_tag_union) });
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
+
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
 }
 
@@ -2637,42 +2589,13 @@ test "explicit empty tag union imports as closed uninhabited row" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const explicit_empty = try type_store.add(.{ .tag_union = Type.Span.empty() });
     const imported = try graph.importMono(explicit_empty);
 
     try std.testing.expectEqual(InstNode.empty_tag_union, graph.content(imported));
-}
-
-test "unsolved zero-tag Monotype imports as unresolved row evidence" {
-    const gpa = std.testing.allocator;
-
-    var type_store = Type.Store.init(gpa);
-    defer type_store.deinit();
-
-    var name_store = names.NameStore.init(gpa);
-    defer name_store.deinit();
-
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
-    defer graph.destroy();
-
-    const unsolved_empty = try type_store.add(.{ .tag_union = Type.Span.empty() });
-    try unsolved_monos.put(unsolved_empty, {});
-
-    const imported = try graph.importMono(unsolved_empty);
-
-    switch (graph.content(imported)) {
-        .unresolved => |variable| try std.testing.expectEqual(checked.RowDefault.empty_tag_union, variable.row_default.?),
-        else => return error.TestUnexpectedResult,
-    }
 }
 
 test "issue 9647: unresolved tag row extension absorbs rest without allocating a rest node" {
@@ -2684,10 +2607,7 @@ test "issue 9647: unresolved tag row extension absorbs rest without allocating a
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const shared_name = try name_store.internTagLabel("Shared");
@@ -2729,10 +2649,7 @@ test "issue 9647: same nominal backing wrapper resolves to structural backing on
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
@@ -2788,10 +2705,7 @@ test "issue 9647: recursive nominal backing cycle is not chased as structural ba
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
@@ -2831,10 +2745,7 @@ test "recursive nominal backing can meet an alias to that nominal" {
     var name_store = names.NameStore.init(gpa);
     defer name_store.deinit();
 
-    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
-    defer unsolved_monos.deinit();
-
-    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    const graph = try InstGraph.create(gpa, &type_store, &name_store);
     defer graph.destroy();
 
     const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
