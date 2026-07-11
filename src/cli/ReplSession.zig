@@ -1450,8 +1450,11 @@ test "Repl - Str.is_empty" {
     try expectAllNative("Str.is_empty(\"a\")", "False");
 }
 
-test "Repl - lambda renders as <function>" {
+test "Repl - lambda with defaulted literal renders as <function>" {
     try expectAllNative("|x| x + 1", "<function>");
+}
+
+test "Repl - unconstrained lambda function value renders as <function>" {
     try expectAllNative("|x, y| x + y", "<function>");
 }
 
