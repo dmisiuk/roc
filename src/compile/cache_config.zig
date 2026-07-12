@@ -46,7 +46,8 @@ pub const Constants = struct {
     /// 20: Nominal declaration table serialized with the type store.
     /// 21: Checked function serialization no longer carries instantiation stamps.
     /// 22: Type descriptors record explicit empty-tag-row default provenance.
-    pub const CACHE_VERSION = 22;
+    /// 23: For-loop dispatch plans carry explicit checked iterator-step topology.
+    pub const CACHE_VERSION = 23;
 };
 
 /// Configuration for the Roc cache system.

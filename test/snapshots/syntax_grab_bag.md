@@ -269,11 +269,7 @@ TYPE MISMATCH - syntax_grab_bag.md:70:5:70:8
 MISSING METHOD - syntax_grab_bag.md:99:3:99:8
 MISSING METHOD - syntax_grab_bag.md:101:3:101:8
 TYPE MISMATCH - syntax_grab_bag.md:84:2:84:2
-TOO FEW ARGS - syntax_grab_bag.md:155:2:157:3
-TYPE MISMATCH - syntax_grab_bag.md:167:3:167:3
 DECLARATION HAS NO VALUE - syntax_grab_bag.md:201:1:201:25
-MISSING METHOD - syntax_grab_bag.md:189:26:189:40
-MISSING METHOD - syntax_grab_bag.md:189:26:189:66
 # PROBLEMS
 
 ┌──────────────────────────┐
@@ -979,43 +975,6 @@ MISSING METHOD - syntax_grab_bag.md:189:26:189:66
     These can never match! Either the pattern or expression has a problem.
 
 
-┌──────────────┐
-│ TOO FEW ARGS ├─ The `match_time` function expects 2 arguments, but it got ──┐
-└┬─────────────┘  1 instead.                                                  │
- │                                                                            │
- │  match_time(                                                               │
- │      ..., # Single args with comment                                       │
- │  )                                                                         │
- │                                                                            │
- └────────────────────────────────────────────────── syntax_grab_bag.md:155:2 ┘
-
-    The `match_time` function has the type:
-
-        [Blue, Green, Red, ..], _arg -> Error
-
-    Are there any missing commas?
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ The first argument being passed to this function has the ──┐
-└┬──────────────┘  wrong type.                                                │
- │                                                                            │
- │  add_one(                                                                  │
- │      dbg # After dbg in list                                               │
- │          number, # after dbg expr as arg                                   │
- │  ), # Comment one                                                          │
- │                                                                            │
- └────────────────────────────────────────────────── syntax_grab_bag.md:167:4 ┘
-
-    This argument has the type:
-
-        {}
-
-    But `add_one` needs the first argument to be:
-
-        U64
-
-
 ┌──────────────────────────┐
 │ DECLARATION HAS NO VALUE ├─ This declaration has a type annotation but no ──┐
 └┬─────────────────────────┘  implementation.                                 │
@@ -1026,36 +985,6 @@ MISSING METHOD - syntax_grab_bag.md:189:26:189:66
 
     Add a value body here, or put hosted functions in a platform type module so
     they are published through the host boundary.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named ────────────────┐
-└┬───────────────┘  `static_dispatch_method` on an unresolved type            │
- │                  variable, but unresolved type variables have no methods.  │
- │                                                                            │
- │  …style = some_fn(arg1)?.static_dispatch_method()?.next_static_dispatch_me…│
- │           ‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                   │
- └───────────────────────────────────────────────── syntax_grab_bag.md:189:26 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named ────────────────┐
-└┬───────────────┘  `next_static_dispatch_method` on an unresolved type       │
- │                  variable, but unresolved type variables have no methods.  │
- │                                                                            │
- │  …style = some_fn(arg1)?.static_dispatch_method()?.next_static_dispatch_me…│
- │           ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                         │
- └───────────────────────────────────────────────── syntax_grab_bag.md:189:26 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
 
 # TOKENS
 ~~~zig
@@ -2274,7 +2203,7 @@ expect {
 				(s-return
 					(e-runtime-error (tag "expr_not_canonicalized")))
 				(s-expr
-					(e-call (constraint-fn-var 1817)
+					(e-call
 						(e-lookup-local
 							(p-assign (ident "match_time")))
 						(e-not-implemented)))
@@ -2297,7 +2226,7 @@ expect {
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "world"))))
-						(e-interpolation (constraint-fn-var 1844)
+						(e-interpolation
 							(first
 								(e-literal (string "Hello, ")))
 							(parts
@@ -2345,13 +2274,11 @@ expect {
 											(e-literal (string "")))))))
 						(s-reassign
 							(p-assign (ident "number"))
-							(e-dispatch-call (method "plus") (constraint-fn-var 1922)
-								(receiver
-									(e-lookup-local
-										(p-assign (ident "number"))))
-								(args
-									(e-lookup-local
-										(p-assign (ident "n"))))))
+							(e-binop (op "add")
+								(e-lookup-local
+									(p-assign (ident "number")))
+								(e-lookup-local
+									(p-assign (ident "n")))))
 						(e-empty_record)))
 				(s-let
 					(p-assign (ident "record"))
@@ -2421,36 +2348,32 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 2058)
-									(receiver
-										(e-match
-											(match
-												(cond
-													(e-tag (name "Err")
-														(args
-															(e-runtime-error (tag "ident_not_in_scope")))))
-												(branches
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-lookup-local
-																(p-assign (ident "#ok")))))
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-num (value "12"))))))))
-									(args
-										(e-dispatch-call (method "times") (constraint-fn-var 2055)
-											(receiver
-												(e-num (value "5")))
-											(args
-												(e-num (value "5"))))))
+								(e-binop (op "gt")
+									(e-match
+										(match
+											(cond
+												(e-tag (name "Err")
+													(args
+														(e-runtime-error (tag "ident_not_in_scope")))))
+											(branches
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-lookup-local
+															(p-assign (ident "#ok")))))
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-num (value "12")))))))
+									(e-binop (op "mul")
+										(e-num (value "5"))
+										(e-num (value "5"))))
 								(e-nominal-external
 									(builtin)
 									(e-tag (name "True")))))
@@ -2461,24 +2384,16 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 2091)
-														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 2081)
-																(receiver
-																	(e-num (value "13")))
-																(args
-																	(e-num (value "2")))))
-														(args
-															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 2118)
-														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 2108)
-																(receiver
-																	(e-num (value "10")))
-																(args
-																	(e-num (value "1")))))
-														(args
-															(e-num (value "16"))))))
+													(e-binop (op "lt")
+														(e-binop (op "add")
+															(e-num (value "13"))
+															(e-num (value "2")))
+														(e-num (value "5")))
+													(e-binop (op "ge")
+														(e-binop (op "sub")
+															(e-num (value "10"))
+															(e-num (value "1")))
+														(e-num (value "16")))))
 											(if-else
 												(e-nominal-external
 													(builtin)
@@ -2487,15 +2402,11 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 2155)
-										(receiver
-											(e-num (value "12")))
-										(args
-											(e-dispatch-call (method "div_by") (constraint-fn-var 2152)
-												(receiver
-													(e-num (value "3")))
-												(args
-													(e-num (value "5")))))))))))
+									(e-binop (op "le")
+										(e-num (value "12"))
+										(e-binop (op "div")
+											(e-num (value "3"))
+											(e-num (value "5")))))))))
 				(s-let
 					(p-assign (ident "static_dispatch_style"))
 					(e-match
@@ -2506,12 +2417,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "next_static_dispatch_method") (constraint-fn-var 2213)
+													(e-method-call (method "next_static_dispatch_method")
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "static_dispatch_method") (constraint-fn-var 2184)
+																		(e-method-call (method "static_dispatch_method")
 																			(receiver
 																				(e-match
 																					(match
@@ -2526,7 +2437,8 @@ expect {
 																										(p-nominal-external (builtin)
 																											(p-applied-tag))))
 																								(value
-																									(e-runtime-error (tag "erroneous_value_expr"))))
+																									(e-lookup-local
+																										(p-assign (ident "#ok")))))
 																							(branch
 																								(patterns
 																									(pattern (degenerate false)
@@ -2548,7 +2460,8 @@ expect {
 																					(p-nominal-external (builtin)
 																						(p-applied-tag))))
 																			(value
-																				(e-runtime-error (tag "erroneous_value_expr"))))
+																				(e-lookup-local
+																					(p-assign (ident "#ok")))))
 																		(branch
 																			(patterns
 																				(pattern (degenerate false)
@@ -2805,7 +2718,7 @@ expect {
 (inferred-types
 	(defs
 		(patt (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
-		(patt (type "Error -> U64"))
+		(patt (type "U64 -> U64"))
 		(patt (type "[Blue, Green, Red, ..], _arg -> Error"))
 		(patt (type "List(Error) -> Try({}, _d)"))
 		(patt (type "{}"))
@@ -2851,7 +2764,7 @@ expect {
 					(ty-rigid-var (name "a"))))))
 	(expressions
 		(expr (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
-		(expr (type "Error -> U64"))
+		(expr (type "U64 -> U64"))
 		(expr (type "[Blue, Green, Red, ..], _arg -> Error"))
 		(expr (type "List(Error) -> Try({}, _d)"))
 		(expr (type "{}"))

@@ -42,7 +42,8 @@ pub const FnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     evidence: []const const_store.ConstFnEvidence = &.{},
-    evidence_frame_root_counts: []const u32 = &.{},
+    evidence_frames: []const const_store.ConstFnEvidenceFrame = &.{},
+    evidence_frame_head: ?u32 = null,
 };
 
 /// Capture field copied from a checked binder into a callable payload.
@@ -243,7 +244,7 @@ pub fn deinitFnSets(allocator: Allocator, fn_sets: []const FnSet) void {
         for (fn_set.variants) |variant| {
             if (variant.captures.len > 0) allocator.free(variant.captures);
             if (variant.template.evidence.len > 0) allocator.free(variant.template.evidence);
-            if (variant.template.evidence_frame_root_counts.len > 0) allocator.free(variant.template.evidence_frame_root_counts);
+            if (variant.template.evidence_frames.len > 0) allocator.free(variant.template.evidence_frames);
         }
         if (fn_set.variants.len > 0) allocator.free(fn_set.variants);
     }
@@ -255,7 +256,7 @@ pub fn deinitErasedFns(allocator: Allocator, erased_fns: []const ErasedFns) void
         for (set.entries) |entry| {
             if (entry.captures.len > 0) allocator.free(entry.captures);
             if (entry.template.evidence.len > 0) allocator.free(entry.template.evidence);
-            if (entry.template.evidence_frame_root_counts.len > 0) allocator.free(entry.template.evidence_frame_root_counts);
+            if (entry.template.evidence_frames.len > 0) allocator.free(entry.template.evidence_frames);
         }
         if (set.entries.len > 0) allocator.free(set.entries);
     }

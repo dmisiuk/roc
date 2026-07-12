@@ -19,6 +19,7 @@ const SolvedInline = @import("solved_inline.zig");
 const Solved = @import("lambda_solved/ast.zig");
 const SolvedType = @import("lambda_solved/type.zig");
 const LambdaMono = @import("lambda_mono/ast.zig");
+const LambdaMonoLower = @import("lambda_mono/lower.zig");
 const MonoType = @import("monotype/type.zig");
 const Type = @import("lambda_mono/type.zig");
 const lir_core = @import("lir_core");
@@ -1071,6 +1072,7 @@ const Lowerer = struct {
                     .backing = if (named.backing) |backing| .{
                         .ty = try self.lowerType(backing.ty),
                         .use = backing.use,
+                        .authority = backing.authority,
                     } else null,
                     .declared_order = try self.lowerDeclaredOrder(named.declared_order),
                 } };
@@ -1475,6 +1477,7 @@ const Lowerer = struct {
                     .backing = if (named.backing) |backing| .{
                         .ty = try self.constTypeOfType(backing.ty),
                         .use = constBackingUse(backing.use),
+                        .authority = constBackingAuthority(backing.authority),
                     } else null,
                     .declared_order = try self.result.const_types.appendDeclaredFieldSpan(stored_declared),
                 } };
@@ -1642,6 +1645,7 @@ const Lowerer = struct {
                     .backing = if (named.backing) |backing| .{
                         .ty = try self.constTypeOfMonoType(backing.ty),
                         .use = constBackingUse(backing.use),
+                        .authority = constBackingAuthority(backing.authority),
                     } else null,
                     .declared_order = try self.result.const_types.appendDeclaredFieldSpan(stored_declared),
                 } };
@@ -1658,7 +1662,7 @@ const Lowerer = struct {
             for (variants[0..initialized]) |variant| {
                 if (variant.captures.len > 0) self.allocator.free(variant.captures);
                 if (variant.template.evidence.len > 0) self.allocator.free(variant.template.evidence);
-                if (variant.template.evidence_frame_root_counts.len > 0) self.allocator.free(variant.template.evidence_frame_root_counts);
+                if (variant.template.evidence_frames.len > 0) self.allocator.free(variant.template.evidence_frames);
             }
             self.allocator.free(variants);
         }
@@ -1707,7 +1711,7 @@ const Lowerer = struct {
             for (entries[0..initialized]) |entry| {
                 if (entry.captures.len > 0) self.allocator.free(entry.captures);
                 if (entry.template.evidence.len > 0) self.allocator.free(entry.template.evidence);
-                if (entry.template.evidence_frame_root_counts.len > 0) self.allocator.free(entry.template.evidence_frame_root_counts);
+                if (entry.template.evidence_frames.len > 0) self.allocator.free(entry.template.evidence_frames);
             }
             self.allocator.free(entries);
         }
@@ -1879,17 +1883,18 @@ const Lowerer = struct {
 
     fn verifyMaterializedDecisions(self: *Lowerer) Common.LowerError!void {
         if (builtin.mode != .Debug) return;
-        const LambdaMonoLower = @import("lambda_mono/lower.zig");
-
         var solved_clone = try cloneSolvedProgram(self.allocator, self.solved);
         var clone_owned = true;
         errdefer if (clone_owned) solved_clone.deinit();
 
+        var materialized_identities = std.ArrayList(LambdaMonoLower.SpecializationIdentity).empty;
+        defer materialized_identities.deinit(self.allocator);
         var materialized = try LambdaMonoLower.run(self.allocator, solved_clone, self.folded_map_matches.items, .{
             .inline_expects = switch (self.inline_expects) {
                 .run => .run,
                 .omit => .omit,
             },
+            .debug_specialization_identities = &materialized_identities,
         });
         clone_owned = false;
         defer materialized.deinit();
@@ -1897,13 +1902,30 @@ const Lowerer = struct {
         var type_equivalence = TypeEquivalence.init(self.allocator, self, &materialized.types);
         defer type_equivalence.deinit();
 
-        try self.verifyFnEntriesMatch(&materialized);
-        try self.verifyRootsMatch(&materialized);
+        try self.verifyFnEntriesMatch(&materialized, materialized_identities.items);
+        try self.verifyRootsMatch(&materialized, materialized_identities.items);
         try self.verifyLayoutRequestsMatch(&materialized, &type_equivalence);
         try self.verifyRuntimeSchemaRequestsMatch(&materialized, &type_equivalence);
     }
 
-    fn verifyFnEntriesMatch(self: *Lowerer, materialized: *const LambdaMono.Program) Common.LowerError!void {
+    fn specializationIdentity(spec: FnSpec) LambdaMonoLower.SpecializationIdentity {
+        return .{
+            .source = spec.source,
+            .solved_fn_ty = spec.solved_fn_ty,
+            .abi = switch (spec.abi) {
+                .finite => .finite,
+                .erased => .erased,
+            },
+            .captures_start = spec.captures.start,
+            .captures_len = spec.captures.len,
+        };
+    }
+
+    fn verifyFnEntriesMatch(
+        self: *Lowerer,
+        materialized: *const LambdaMono.Program,
+        identities: []const LambdaMonoLower.SpecializationIdentity,
+    ) Common.LowerError!void {
         var reachable_count: usize = 0;
         for (self.fn_reachable.items) |reachable| {
             if (reachable) reachable_count += 1;
@@ -1912,23 +1934,29 @@ const Lowerer = struct {
             Common.invariant("debug Lambda Mono verifier saw too many direct function specs");
         }
         const materialized_fns = materialized.fnsView();
-        const used = try self.allocator.alloc(bool, materialized_fns.len);
-        defer self.allocator.free(used);
-        @memset(used, false);
+        if (identities.len != materialized_fns.len) {
+            Common.invariant("debug Lambda Mono verifier saw a specialization identity count mismatch");
+        }
+        var by_identity = std.AutoHashMap(LambdaMonoLower.SpecializationIdentity, LambdaMono.FnId).init(self.allocator);
+        defer by_identity.deinit();
+        for (identities, 0..) |identity, index| {
+            const result = try by_identity.getOrPut(identity);
+            if (result.found_existing) {
+                Common.invariant("debug Lambda Mono verifier saw duplicate specialization identities");
+            }
+            result.value_ptr.* = @enumFromInt(@as(u32, @intCast(index)));
+        }
 
         for (self.fn_entries.items, 0..) |entry, entry_index| {
             // Direct LIR keeps type-level entries so callable layouts and
             // ConstStore metadata can refer to source templates without forcing
             // every queued Lambda Mono function into a LIR proc.
             if (!self.fn_reachable.items[entry_index]) continue;
-            for (materialized_fns, 0..) |fn_, index| {
-                if (used[index]) continue;
-                if (try self.fnEntryMatchesMaterialized(entry, fn_, materialized)) {
-                    used[index] = true;
-                    break;
-                }
-            } else {
+            const materialized_fn_id = by_identity.get(specializationIdentity(entry.spec)) orelse {
                 Common.invariant("debug Lambda Mono verifier could not match a direct function spec");
+            };
+            if (!try self.fnEntryMatchesMaterialized(entry, materialized.getFn(materialized_fn_id), materialized)) {
+                Common.invariant("debug Lambda Mono verifier saw different types for an exact function specialization");
             }
         }
     }
@@ -1960,7 +1988,11 @@ const Lowerer = struct {
         return true;
     }
 
-    fn verifyRootsMatch(self: *Lowerer, materialized: *const LambdaMono.Program) Common.LowerError!void {
+    fn verifyRootsMatch(
+        self: *Lowerer,
+        materialized: *const LambdaMono.Program,
+        identities: []const LambdaMonoLower.SpecializationIdentity,
+    ) Common.LowerError!void {
         const roots = materialized.rootsView();
         if (self.roots.items.len != roots.len) {
             Common.invariant("debug Lambda Mono verifier saw a root count mismatch");
@@ -1968,6 +2000,12 @@ const Lowerer = struct {
         for (self.roots.items, roots) |direct, expected| {
             if (!std.meta.eql(direct.request, expected.request)) {
                 Common.invariant("debug Lambda Mono verifier saw a root mismatch");
+            }
+            if (!std.meta.eql(
+                specializationIdentity(self.fn_entries.items[@intFromEnum(direct.fn_id)].spec),
+                identities[@intFromEnum(expected.fn_id)],
+            )) {
+                Common.invariant("debug Lambda Mono verifier saw a root specialization identity mismatch");
             }
             const expected_fn = materialized.getFn(expected.fn_id);
             if (!try self.fnEntryMatchesMaterialized(self.fn_entries.items[@intFromEnum(direct.fn_id)], expected_fn, materialized)) {
@@ -2068,6 +2106,7 @@ const Lowerer = struct {
                     .next = next,
                 } });
             },
+            .@"unreachable" => Common.invariant("unreachable marker escaped its terminated block-final position during direct LIR lowering"),
             .uninitialized, .uninitialized_payload => next,
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
@@ -3973,7 +4012,19 @@ const Lowerer = struct {
         next: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         const stmts = self.solved.lifted.stmtSpan(stmts_span);
-        var current = try self.lowerExprIntoAtType(target, final_expr, result_ty, next);
+        var current = switch (self.solved.lifted.getExpr(final_expr).data) {
+            .@"unreachable" => blk: {
+                if (stmts.len == 0) {
+                    Common.invariant("unreachable block-final marker had no preceding terminating statement");
+                }
+                // Monotype emits this marker only after its checked, explicit
+                // statement-termination relation has stopped the block. Its
+                // block-final position is the capability to erase it; the
+                // generic expression path rejects the marker.
+                break :blk next;
+            },
+            else => try self.lowerExprIntoAtType(target, final_expr, result_ty, next),
+        };
         var i = stmts.len;
         while (i > 0) {
             i -= 1;
@@ -5601,6 +5652,7 @@ const Lowerer = struct {
 
     fn joinArgNeedsWriteAtType(self: *Lowerer, param: LIR.LocalId, ty: Type.TypeId, expr_id: Lifted.ExprId) Common.LowerError!bool {
         return switch (self.solved.lifted.getExpr(expr_id).data) {
+            .@"unreachable" => Common.invariant("unreachable marker escaped its terminated block-final position into a direct join argument"),
             .uninitialized, .uninitialized_payload => false,
             .local => |local| (self.existingLocalForTyped(local, ty) orelse return true) != param,
             else => true,
@@ -6476,6 +6528,7 @@ const Lowerer = struct {
         };
         if (lhs.backing == null or rhs.backing == null) return lhs.backing == null and rhs.backing == null;
         if (lhs.backing.?.use != rhs.backing.?.use) return false;
+        if (lhs.backing.?.authority != rhs.backing.?.authority) return false;
         var visited = std.AutoHashMap(u64, void).init(self.allocator);
         defer visited.deinit();
         return try self.publicTypesEquivalent(lhs.backing.?.ty, rhs.backing.?.ty, &visited);
@@ -7259,6 +7312,7 @@ const TypeEquivalence = struct {
                 if (!try self.typeSpansEquivalent(named.args, other.args)) break :blk false;
                 if (named.backing == null or other.backing == null) break :blk named.backing == null and other.backing == null;
                 if (named.backing.?.use != other.backing.?.use) break :blk false;
+                if (named.backing.?.authority != other.backing.?.authority) break :blk false;
                 break :blk try self.equivalent(named.backing.?.ty, other.backing.?.ty);
             },
         };
@@ -7378,8 +7432,8 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
     var const_fn_evidence = try clonedLiftedProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence", allocator, view.const_fn_evidence);
     errdefer const_fn_evidence.deinit(allocator);
 
-    var const_fn_evidence_frame_root_counts = try clonedLiftedProgramList(u32, "const_fn_evidence_frame_root_counts", allocator, view.const_fn_evidence_frame_root_counts);
-    errdefer const_fn_evidence_frame_root_counts.deinit(allocator);
+    var const_fn_evidence_frames = try clonedLiftedProgramList(check.ConstStore.ConstFnEvidenceFrame, "const_fn_evidence_frames", allocator, view.const_fn_evidence_frames);
+    errdefer const_fn_evidence_frames.deinit(allocator);
 
     return .{
         .allocator = allocator,
@@ -7388,7 +7442,7 @@ fn cloneLiftedProgram(allocator: std.mem.Allocator, program: *const Lifted.Progr
         .types = types,
         .imported_fns = try clonedLiftedProgramList(Lifted.ImportedFn, "imported_fns", allocator, view.imported_fns),
         .const_fn_evidence = const_fn_evidence,
-        .const_fn_evidence_frame_root_counts = const_fn_evidence_frame_root_counts,
+        .const_fn_evidence_frames = const_fn_evidence_frames,
         .fns = try clonedLiftedProgramList(Lifted.Fn, "fns", allocator, view.fns),
         .exprs = try clonedLiftedProgramList(Lifted.Expr, "exprs", allocator, view.exprs),
         .pats = try clonedLiftedProgramList(Lifted.Pat, "pats", allocator, view.pats),
@@ -7598,22 +7652,42 @@ fn constBackingUse(use: MonoType.BackingUse) const_store.TypeBackingUse {
     };
 }
 
+fn constBackingAuthority(authority: MonoType.BackingAuthority) const_store.TypeBackingAuthority {
+    return switch (authority) {
+        .checked_public => .checked_public,
+        .generated_private => .generated_private,
+    };
+}
+
 fn lirSymbol(symbol: Common.Symbol) LIR.Symbol {
     return LIR.Symbol.fromRaw(@intCast(@intFromEnum(symbol)));
 }
 
 fn constFnTemplateFromMono(self: *Lowerer, template: Mono.FnTemplate) std.mem.Allocator.Error!LirProgram.FnTemplate {
+    requireConstFnEvidenceTopology(template);
     const lifted = self.solved.lifted.view();
     const evidence = try self.allocator.dupe(check.ConstStore.ConstFnEvidence, lifted.const_fn_evidence[template.const_evidence.start..][0..template.const_evidence.len]);
     errdefer self.allocator.free(evidence);
-    const frame_root_counts = try self.allocator.dupe(u32, lifted.const_fn_evidence_frame_root_counts[template.const_evidence_frame_root_counts.start..][0..template.const_evidence_frame_root_counts.len]);
+    const evidence_frames = try self.allocator.dupe(check.ConstStore.ConstFnEvidenceFrame, lifted.const_fn_evidence_frames[template.const_evidence_frames.start..][0..template.const_evidence_frames.len]);
     return .{
         .fn_def = constFnDefFromMono(template.fn_def),
         .source_fn_ty = template.source_fn_ty,
         .source_fn_key = template.source_fn_key,
         .evidence = evidence,
-        .evidence_frame_root_counts = frame_root_counts,
+        .evidence_frames = evidence_frames,
+        .evidence_frame_head = template.const_evidence_frame_head,
     };
+}
+
+fn requireConstFnEvidenceTopology(template: Mono.FnTemplate) void {
+    if (template.const_evidence_frames.len != 0 and template.const_evidence_frame_head != null) return;
+    switch (template.fn_def) {
+        .parser_runtime, .encoder_for_runtime => {},
+        .nested => Common.invariant("nested callable reached solved LIR without explicit evidence topology"),
+        .local_template, .imported_template => Common.invariant("template callable reached solved LIR without explicit evidence topology"),
+        .local_hosted, .imported_hosted => Common.invariant("hosted callable reached solved LIR without explicit evidence topology"),
+        .checked_generated => Common.invariant("checked-generated callable reached solved LIR without explicit evidence topology"),
+    }
 }
 
 fn constFnDefFromMono(fn_def: Mono.FnDef) check.ConstStore.FnDef {

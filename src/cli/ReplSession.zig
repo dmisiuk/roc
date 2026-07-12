@@ -1458,6 +1458,17 @@ test "Repl - unconstrained lambda function value renders as <function>" {
     try expectAllNative("|x, y| x + y", "<function>");
 }
 
+test "Repl - recursive function preserves an unconstrained empty list" {
+    const steps = &[_][2][]const u8{
+        .{
+            "loop = |items, n| if n == 0.U64 { items } else { loop(items, n - 1.U64) }",
+            "assigned `loop`",
+        },
+        .{ "loop([], 1.U64)", "[]" },
+    };
+    try expectStateful(.interpreter, steps);
+}
+
 test "Repl - Str.to_utf8 bytes" {
     try expectAllNative("Str.to_utf8(\"hello\")", "[104, 101, 108, 108, 111]");
 }

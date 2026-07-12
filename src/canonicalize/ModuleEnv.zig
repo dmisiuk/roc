@@ -542,12 +542,27 @@ pub const MethodDefs = SortedArrayBuilder(MethodKey, MethodBinding);
 /// Checking writes this when it creates the loop's required `iter` and `next`
 /// static-dispatch constraints. Checked artifact publication consumes it to
 /// publish an explicit iterator-for plan for mono lowering.
+pub const IteratorStepTopology = extern struct {
+    done_tag_ident: u32,
+    one_tag_ident: u32,
+    skip_tag_ident: u32,
+    item_field_ident: u32,
+    rest_field_ident: u32,
+    one_payload_var: u32,
+    skip_payload_var: u32,
+};
+
+/// Checker-owned dispatch and topology data for one source `for` loop.
+///
+/// Later compiler stages consume these exact identifiers and type variables
+/// instead of inferring iterator structure from names or row shapes.
 pub const ForLoopDispatchPlan = extern struct {
     node_idx: u32,
     pattern_idx: u32,
     iterable_idx: u32,
     iter_fn_var: u32,
     next_fn_var: u32,
+    step_topology: IteratorStepTopology,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -611,8 +626,9 @@ pub const SchemeInstantiationRecord = extern struct {
     /// use vs. the target of a dispatch constraint).
     slot_kind: u32,
     /// For `dispatch_target` slots, the raw fn `Var` of the constraint whose
-    /// discharge instantiated this scheme — unique per constraint
-    /// instantiation, so nested evidence chains resolve without ambiguity.
+    /// discharge instantiated this scheme. This raw var is the logical
+    /// dispatch-edge identity; checking publishes exactly one selected-target
+    /// instantiation for it even if the deferred edge is revisited.
     /// 0 for `value_use` slots (keyed by `node_idx` instead).
     slot_data: u32,
     /// The pristine scheme root `Var` that was instantiated. For imported
@@ -3560,6 +3576,7 @@ pub fn recordForLoopDispatchPlan(
     iterable_idx: Node.Idx,
     iter_fn_var: TypeVar,
     next_fn_var: TypeVar,
+    step_topology: IteratorStepTopology,
 ) std.mem.Allocator.Error!void {
     const raw_node: u32 = @intFromEnum(node_idx);
     const raw_pattern: u32 = @intFromEnum(pattern_idx);
@@ -3572,6 +3589,7 @@ pub fn recordForLoopDispatchPlan(
             .iterable_idx = raw_iterable,
             .iter_fn_var = @intFromEnum(iter_fn_var),
             .next_fn_var = @intFromEnum(next_fn_var),
+            .step_topology = step_topology,
         };
         return;
     }
@@ -3581,6 +3599,7 @@ pub fn recordForLoopDispatchPlan(
         .iterable_idx = raw_iterable,
         .iter_fn_var = @intFromEnum(iter_fn_var),
         .next_fn_var = @intFromEnum(next_fn_var),
+        .step_topology = step_topology,
     });
 }
 

@@ -75,10 +75,20 @@ pub const BackingUse = enum(u8) {
     runtime_layout_only,
 };
 
+/// Authority carried by a named backing. Checked-public backings describe the
+/// interface produced by checking. Generated-private backings carry explicit
+/// post-check specialization evidence and must never be merged into that
+/// public interface.
+pub const BackingAuthority = enum(u8) {
+    checked_public,
+    generated_private,
+};
+
 /// Backing type for a named type when checking output one.
 pub const NamedBacking = struct {
     ty: TypeId,
     use: BackingUse,
+    authority: BackingAuthority = .checked_public,
 };
 
 /// Kind of named type visible after checking.
@@ -853,13 +863,9 @@ pub const Store = struct {
                 if (named_mode == .full) {
                     self.writeCachedNamedBackingDigest(name_store, hasher, named.backing, ctx, stats);
                     self.writeCachedDeclaredOrderDigest(name_store, hasher, named.declared_order, ctx, stats);
-                } else if (named.builtin_owner) |owner| {
-                    if (generatedEvidenceOwnerUsesBacking(owner)) {
-                        writeBytes(hasher, "specialization-builtin-backing");
-                        self.writeCachedNamedBackingDigest(name_store, hasher, named.backing, ctx, stats);
-                    } else {
-                        writeBytes(hasher, "specialization-named-identity");
-                    }
+                } else if (specializationUsesBacking(named.backing)) {
+                    writeBytes(hasher, "specialization-generated-backing");
+                    self.writeCachedNamedBackingDigest(name_store, hasher, named.backing, ctx, stats);
                 } else {
                     writeBytes(hasher, "specialization-named-identity");
                 }
@@ -920,6 +926,7 @@ pub const Store = struct {
         writeBytes(hasher, "backing");
         if (backing) |named_backing| {
             writeBytes(hasher, @tagName(named_backing.use));
+            writeBytes(hasher, @tagName(named_backing.authority));
             self.writeCachedChildDigest(name_store, hasher, named_backing.ty, .full, ctx, stats);
         } else {
             writeBytes(hasher, "none");
@@ -1011,13 +1018,9 @@ pub const Store = struct {
                 if (named_mode == .full) {
                     self.writeNamedBackingDigest(name_store, hasher, named.backing, visiting);
                     self.writeDeclaredOrderDigest(name_store, hasher, named.declared_order, visiting);
-                } else if (named.builtin_owner) |owner| {
-                    if (generatedEvidenceOwnerUsesBacking(owner)) {
-                        writeBytes(hasher, "specialization-builtin-backing");
-                        self.writeNamedBackingDigest(name_store, hasher, named.backing, visiting);
-                    } else {
-                        writeBytes(hasher, "specialization-named-identity");
-                    }
+                } else if (specializationUsesBacking(named.backing)) {
+                    writeBytes(hasher, "specialization-generated-backing");
+                    self.writeNamedBackingDigest(name_store, hasher, named.backing, visiting);
                 } else {
                     writeBytes(hasher, "specialization-named-identity");
                 }
@@ -1093,6 +1096,7 @@ pub const Store = struct {
         writeBytes(hasher, "backing");
         if (backing) |named_backing| {
             writeBytes(hasher, @tagName(named_backing.use));
+            writeBytes(hasher, @tagName(named_backing.authority));
             self.writeTypeDigest(name_store, hasher, named_backing.ty, visiting, .full);
         } else {
             writeBytes(hasher, "none");
@@ -1233,12 +1237,11 @@ fn namedTypeViewEql(
         return try typeViewEqlInner(type_view, name_store, lhs_backing.ty, rhs_backing.ty, visited);
     }
 
-    if (lhs.builtin_owner) |owner| {
-        if (generatedEvidenceOwnerUsesBacking(owner)) {
-            const lhs_backing = lhs.backing orelse return rhs.backing == null;
-            const rhs_backing = rhs.backing orelse return false;
-            return try typeViewEqlInner(type_view, name_store, lhs_backing.ty, rhs_backing.ty, visited);
-        }
+    if (specializationUsesBacking(lhs.backing) or specializationUsesBacking(rhs.backing)) {
+        const lhs_backing = lhs.backing orelse return false;
+        const rhs_backing = rhs.backing orelse return false;
+        if (lhs_backing.use != rhs_backing.use or lhs_backing.authority != rhs_backing.authority) return false;
+        return try typeViewEqlInner(type_view, name_store, lhs_backing.ty, rhs_backing.ty, visited);
     }
 
     return true;
@@ -1549,12 +1552,11 @@ fn namedTypeEqlAcrossStores(
         return try typeEqlAcrossStoresInner(name_store, lhs_view, lhs_backing.ty, rhs_view, rhs_backing.ty, visited);
     }
 
-    if (lhs.builtin_owner) |owner| {
-        if (generatedEvidenceOwnerUsesBacking(owner)) {
-            const lhs_backing = lhs.backing orelse return rhs.backing == null;
-            const rhs_backing = rhs.backing orelse return false;
-            return try typeEqlAcrossStoresInner(name_store, lhs_view, lhs_backing.ty, rhs_view, rhs_backing.ty, visited);
-        }
+    if (specializationUsesBacking(lhs.backing) or specializationUsesBacking(rhs.backing)) {
+        const lhs_backing = lhs.backing orelse return false;
+        const rhs_backing = rhs.backing orelse return false;
+        if (lhs_backing.use != rhs_backing.use or lhs_backing.authority != rhs_backing.authority) return false;
+        return try typeEqlAcrossStoresInner(name_store, lhs_view, lhs_backing.ty, rhs_view, rhs_backing.ty, visited);
     }
 
     return true;
@@ -1847,6 +1849,7 @@ pub const Interner = opaque {
     pub const RecursiveNamedBacking = struct {
         ty: RecursiveLink,
         use: BackingUse,
+        authority: BackingAuthority = .checked_public,
     };
 
     pub const RecursiveNamed = struct {
@@ -1997,6 +2000,7 @@ pub const Interner = opaque {
             .backing = if (named.backing) |backing| .{
                 .ty = self.lowerRecursiveLink(ids, root, backing.ty),
                 .use = backing.use,
+                .authority = backing.authority,
             } else null,
             .declared_order = named.declared_order,
         };
@@ -2103,14 +2107,8 @@ fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     hasher.update(bytes);
 }
 
-fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bool {
-    return switch (owner) {
-        .fields,
-        .field,
-        .parse_tag_union_spec,
-        => true,
-        else => false,
-    };
+fn specializationUsesBacking(backing: ?NamedBacking) bool {
+    return if (backing) |present| present.authority == .generated_private else false;
 }
 
 fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
@@ -2792,7 +2790,7 @@ test "monotype named type digest includes backing" {
     try std.testing.expect(std.mem.eql(u8, i64_spec_digest.bytes[0..], str_spec_digest.bytes[0..]));
 }
 
-test "monotype specialization digest includes builtin evidence backing" {
+test "monotype specialization identity includes generated backing without builtin owner" {
     var name_store = names.NameStore.init(std.testing.allocator);
     defer name_store.deinit();
 
@@ -2800,31 +2798,74 @@ test "monotype specialization digest includes builtin evidence backing" {
     defer store.deinit();
 
     const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
-    const type_name = try name_store.internTypeName("FieldNames");
+    const type_name = try name_store.internTypeName("GeneratedEvidence");
     const checked_ty: checked.CheckedTypeId = @enumFromInt(1);
     const i64_ty = try store.add(.{ .primitive = .i64 });
     const str_ty = try store.add(.{ .primitive = .str });
 
-    const fields_i64 = try store.add(.{ .named = .{
+    const evidence_i64 = try store.add(.{ .named = .{
         .named_type = .{ .module = .{}, .ty = checked_ty },
         .def = .{ .module = module_identity, .type_name = type_name },
         .kind = .@"opaque",
-        .builtin_owner = .fields,
         .args = Span.empty(),
-        .backing = .{ .ty = i64_ty, .use = .runtime_layout_only },
+        .backing = .{ .ty = i64_ty, .use = .runtime_layout_only, .authority = .generated_private },
     } });
-    const fields_str = try store.add(.{ .named = .{
+    const evidence_str = try store.add(.{ .named = .{
         .named_type = .{ .module = .{}, .ty = checked_ty },
         .def = .{ .module = module_identity, .type_name = type_name },
         .kind = .@"opaque",
-        .builtin_owner = .fields,
         .args = Span.empty(),
-        .backing = .{ .ty = str_ty, .use = .runtime_layout_only },
+        .backing = .{ .ty = str_ty, .use = .runtime_layout_only, .authority = .generated_private },
     } });
 
-    const i64_spec_digest = store.specializationDigest(&name_store, fields_i64);
-    const str_spec_digest = store.specializationDigest(&name_store, fields_str);
+    const i64_spec_digest = store.specializationDigest(&name_store, evidence_i64);
+    const str_spec_digest = store.specializationDigest(&name_store, evidence_str);
     try std.testing.expect(!std.mem.eql(u8, i64_spec_digest.bytes[0..], str_spec_digest.bytes[0..]));
+    try std.testing.expect(!try store.typeEql(&name_store, evidence_i64, evidence_str));
+    try std.testing.expect(!try typeEqlAcrossStores(
+        std.testing.allocator,
+        &name_store,
+        store.view(),
+        evidence_i64,
+        store.view(),
+        evidence_str,
+    ));
+}
+
+test "monotype named backing authority participates in durable identity" {
+    var name_store = names.NameStore.init(std.testing.allocator);
+    defer name_store.deinit();
+
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAC} ** 32));
+    const type_name = try name_store.internTypeName("UnownedEvidence");
+    const backing = try store.add(.{ .record = Span.empty() });
+    const base = NamedContent{
+        .named_type = .{ .module = .{}, .ty = @enumFromInt(1) },
+        .def = .{ .module = module_identity, .type_name = type_name },
+        .kind = .@"opaque",
+        .args = Span.empty(),
+        .backing = .{ .ty = backing, .use = .runtime_layout_only },
+    };
+    const public = try store.add(.{ .named = base });
+    var private_content = base;
+    private_content.backing.?.authority = .generated_private;
+    const private = try store.add(.{ .named = private_content });
+
+    const public_digest = store.specializationDigest(&name_store, public);
+    const private_digest = store.specializationDigest(&name_store, private);
+    try std.testing.expect(!std.mem.eql(u8, public_digest.bytes[0..], private_digest.bytes[0..]));
+    try std.testing.expect(!try store.typeEql(&name_store, public, private));
+    try std.testing.expect(!try typeEqlAcrossStores(
+        std.testing.allocator,
+        &name_store,
+        store.view(),
+        public,
+        store.view(),
+        private,
+    ));
 }
 
 test "monotype named type digest includes nested named backing" {

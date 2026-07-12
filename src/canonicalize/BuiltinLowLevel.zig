@@ -17,30 +17,57 @@ pub fn isBuiltinModule(env: *const ModuleEnv) bool {
     return env.module_role == .builtin;
 }
 
-/// Returns whether an annotation-only Builtin declaration is handled as an intrinsic wrapper.
-pub fn isIntrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) bool {
-    if (ident.eql(env.idents.builtin_str_inspect)) return true;
+/// Stable compiler-owned identity for each annotation-only Builtin intrinsic.
+pub const IntrinsicId = enum(u8) {
+    str_inspect,
+    structural_eq,
+    parse_tag_union,
+    field_names_rename_fields,
+    field_names_shortest_name,
+    field_names_longest_name,
+    field_names_iter,
+    field_names_for_size,
+    field_name,
 
-    if (env.common.findIdent("Builtin.Str.Utf8Problem.is_eq")) |utf8_problem_eq| {
-        if (ident.eql(utf8_problem_eq)) return true;
-    }
-
-    const parse_intrinsics = [_][]const u8{
-        "Builtin.Encoding.ParseTagUnionSpec.parse",
-        "Builtin.Encoding.FieldName.FieldNames.rename_fields",
-        "Builtin.Encoding.FieldName.FieldNames.shortest_name",
-        "Builtin.Encoding.FieldName.FieldNames.longest_name",
-        "Builtin.Encoding.FieldName.FieldNames.iter",
-        "Builtin.Encoding.FieldName.FieldNames.for_size",
-        "Builtin.Encoding.FieldName.name",
+    pub const RequestResultSource = union(enum(u8)) {
+        declared_return,
+        argument: u8,
     };
-    for (parse_intrinsics) |name| {
-        if (env.common.findIdent(name)) |intrinsic| {
-            if (ident.eql(intrinsic)) return true;
+
+    /// Explicit request-topology contract for compiler-owned intrinsic calls.
+    pub fn requestResultSource(self: IntrinsicId) RequestResultSource {
+        return switch (self) {
+            .field_names_rename_fields => .{ .argument = 0 },
+            else => .declared_return,
+        };
+    }
+};
+
+/// Producer-owned identity for an annotation-only compiler intrinsic.
+pub fn intrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) ?IntrinsicId {
+    if (ident.eql(env.idents.builtin_str_inspect)) return .str_inspect;
+
+    const entries = [_]struct { name: []const u8, intrinsic: IntrinsicId }{
+        .{ .name = "Builtin.Str.Utf8Problem.is_eq", .intrinsic = .structural_eq },
+        .{ .name = "Builtin.Encoding.ParseTagUnionSpec.parse", .intrinsic = .parse_tag_union },
+        .{ .name = "Builtin.Encoding.FieldName.FieldNames.rename_fields", .intrinsic = .field_names_rename_fields },
+        .{ .name = "Builtin.Encoding.FieldName.FieldNames.shortest_name", .intrinsic = .field_names_shortest_name },
+        .{ .name = "Builtin.Encoding.FieldName.FieldNames.longest_name", .intrinsic = .field_names_longest_name },
+        .{ .name = "Builtin.Encoding.FieldName.FieldNames.iter", .intrinsic = .field_names_iter },
+        .{ .name = "Builtin.Encoding.FieldName.FieldNames.for_size", .intrinsic = .field_names_for_size },
+        .{ .name = "Builtin.Encoding.FieldName.name", .intrinsic = .field_name },
+    };
+    for (entries) |entry| {
+        if (env.common.findIdent(entry.name)) |intrinsic_ident| {
+            if (ident.eql(intrinsic_ident)) return entry.intrinsic;
         }
     }
+    return null;
+}
 
-    return false;
+/// Returns whether an annotation-only Builtin declaration is handled as an intrinsic wrapper.
+pub fn isIntrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) bool {
+    return intrinsicAnnotation(env, ident) != null;
 }
 
 /// Replaces Builtin.roc annotation-only primitive declarations with low-level operation lambdas.

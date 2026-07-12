@@ -19,9 +19,27 @@ pub const InlineExpectMode = enum {
     omit,
 };
 
+/// Producer-owned identity of one Lambda Mono function specialization. Debug
+/// cross-checks use this exact key instead of reconstructing correspondence
+/// from independently allocated Monotype shapes.
+pub const SpecializationCaptureAbi = enum {
+    finite,
+    erased,
+};
+
+/// Exact producer data used to compare Lambda Mono specialization identities.
+pub const SpecializationIdentity = struct {
+    source: Lifted.FnId,
+    solved_fn_ty: SolvedType.TypeVarId,
+    abi: SpecializationCaptureAbi,
+    captures_start: u32,
+    captures_len: u32,
+};
+
 /// Options used by Lambda Mono lowering.
 pub const Options = struct {
     inline_expects: InlineExpectMode = .run,
+    debug_specialization_identities: ?*std.ArrayList(SpecializationIdentity) = null,
 };
 
 /// Lower Lambda Solved IR into Lambda Mono IR.
@@ -38,14 +56,14 @@ pub fn run(
 
     var string_literals = owned.lifted.takeStringLiterals();
     var const_fn_evidence = owned.lifted.const_fn_evidence.takeArrayList();
-    var const_fn_evidence_frame_root_counts = owned.lifted.const_fn_evidence_frame_root_counts.takeArrayList();
+    var const_fn_evidence_frames = owned.lifted.const_fn_evidence_frames.takeArrayList();
     var name_store = owned.lifted.names;
     owned.lifted.names = @import("check").CheckedNames.NameStore.init(allocator);
-    var program = Ast.Program.init(allocator, name_store, string_literals, const_fn_evidence, const_fn_evidence_frame_root_counts);
+    var program = Ast.Program.init(allocator, name_store, string_literals, const_fn_evidence, const_fn_evidence_frames);
     name_store = undefined;
     string_literals = undefined;
     const_fn_evidence = undefined;
-    const_fn_evidence_frame_root_counts = undefined;
+    const_fn_evidence_frames = undefined;
     program.source_files = Ast.ProgramList([]const u8, "source_files").fromArrayList(owned.lifted.takeSourceFiles());
     errdefer program.deinit();
 
@@ -57,6 +75,11 @@ pub fn run(
     }
     defer lowerer.deinit();
     try lowerer.lower();
+    if (options.debug_specialization_identities) |identities| {
+        if (identities.items.len != program.fnCount()) {
+            Common.invariant("Lambda Mono debug specialization identities diverged from the function table");
+        }
+    }
     program.next_symbol = lowerer.symbols.next;
 
     owned.deinit();
@@ -72,7 +95,7 @@ fn movedSolvedView(source: *const Solved.Program, moved: *const Ast.Program) Sol
             .types = lifted.types,
             .imported_fns = lifted.imported_fns,
             .const_fn_evidence = moved.const_fn_evidence.unsafeRawItemsForView(),
-            .const_fn_evidence_frame_root_counts = moved.const_fn_evidence_frame_root_counts.unsafeRawItemsForView(),
+            .const_fn_evidence_frames = moved.const_fn_evidence_frames.unsafeRawItemsForView(),
             .fns = lifted.fns,
             .exprs = lifted.exprs,
             .pats = lifted.pats,
@@ -119,10 +142,7 @@ const CaptureBinding = struct {
     ty: Type.TypeId,
 };
 
-const CaptureAbi = enum {
-    finite,
-    erased,
-};
+const CaptureAbi = SpecializationCaptureAbi;
 
 const CaptureSpanId = struct {
     start: u32,
@@ -219,6 +239,7 @@ const Lowerer = struct {
     erased_capture_ptr_ty: ?Type.TypeId = null,
     unit_ty: ?Type.TypeId = null,
     inline_expects: InlineExpectMode,
+    debug_specialization_identities: ?*std.ArrayList(SpecializationIdentity),
     /// Replays the match resolutions direct LIR lowering recorded, so the
     /// debug verifier sees the same set of demanded functions. Keyed by the
     /// match's scrutinee expression.
@@ -230,6 +251,11 @@ const Lowerer = struct {
         program: *Ast.Program,
         options: Options,
     ) Allocator.Error!Lowerer {
+        if (options.debug_specialization_identities) |identities| {
+            if (identities.items.len != 0) {
+                Common.invariant("Lambda Mono debug specialization identity output was not empty");
+            }
+        }
         const local_map = try allocator.alloc(?Ast.LocalId, solved.lifted.locals.len);
         errdefer allocator.free(local_map);
         @memset(local_map, null);
@@ -268,6 +294,7 @@ const Lowerer = struct {
             .captures = std.AutoHashMap(Lifted.LocalId, CaptureBinding).init(allocator),
             .symbols = .{ .next = solved.lifted.next_symbol },
             .inline_expects = options.inline_expects,
+            .debug_specialization_identities = options.debug_specialization_identities,
         };
     }
 
@@ -466,6 +493,15 @@ const Lowerer = struct {
         try self.program.fns.append(self.allocator, undefined);
         try self.fn_specs.append(self.allocator, spec);
         try self.fn_written.append(self.allocator, false);
+        if (self.debug_specialization_identities) |identities| {
+            try identities.append(self.allocator, .{
+                .source = spec.source,
+                .solved_fn_ty = spec.solved_fn_ty,
+                .abi = spec.abi,
+                .captures_start = spec.captures.start,
+                .captures_len = spec.captures.len,
+            });
+        }
         result.value_ptr.* = fn_id;
         if (self.solved.lifted.procDebugName(source_fn.symbol)) |name| {
             try self.program.setProcDebugName(symbol, name);
@@ -560,6 +596,7 @@ const Lowerer = struct {
             .dec_lit => |value| .{ .dec_lit = value },
             .str_lit => |value| .{ .str_lit = value },
             .bytes_lit => |value| .{ .bytes_lit = value },
+            .@"unreachable" => .@"unreachable",
             .uninitialized => .uninitialized,
             .uninitialized_payload => |payload| .{ .uninitialized_payload = .{
                 .condition = try self.localFor(payload.condition, try self.lowerType(self.solved.local_tys[@intFromEnum(payload.condition)])),
@@ -1104,6 +1141,7 @@ const Lowerer = struct {
                     .backing = if (named.backing) |backing| .{
                         .ty = try self.lowerType(backing.ty),
                         .use = backing.use,
+                        .authority = backing.authority,
                     } else null,
                     .declared_order = try self.lowerDeclaredOrder(named.declared_order),
                 } };

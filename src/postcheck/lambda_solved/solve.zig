@@ -598,6 +598,7 @@ const Solver = struct {
                 try self.unify(self.localTy(sequence.rest_local), try self.recordField(ok_record_ty, sequence.rest_field));
                 _ = try self.expectExpr(sequence.ok_body, expected);
             },
+            .@"unreachable" => {},
             .block => |block| {
                 for (self.lifted.stmtSpan(block.statements)) |stmt| try self.inferStmt(stmt);
                 _ = try self.expectExpr(block.final_expr, expected);
@@ -784,7 +785,7 @@ const Solver = struct {
 
     fn hasGeneratedOpaquePatOwner(self: *Solver, pat_id: Lifted.PatId) bool {
         return switch (self.lifted.types.get(self.lifted.pats[@intFromEnum(pat_id)].ty)) {
-            .named => |named| isGeneratedOpaqueEvidenceOwner(named.builtin_owner),
+            .named => |named| if (named.backing) |backing| backing.authority == .generated_private else false,
             else => false,
         };
     }
@@ -802,23 +803,11 @@ const Solver = struct {
         const generated = self.program.types.rootCompressed(generated_ty);
         const expected = self.program.types.rootCompressed(expected_ty);
         if (generated == expected) return;
-
-        const generated_score = generatedBackingScore(self.program.types.get(generated)) orelse {
-            try self.unify(generated, expected);
-            return;
-        };
-        const expected_score = generatedBackingScore(self.program.types.get(expected)) orelse {
-            try self.unify(generated, expected);
-            return;
-        };
-
-        if (generated_score > expected_score) {
-            self.program.types.set(expected, .{ .link = generated });
-        } else if (expected_score > generated_score) {
-            self.program.types.set(generated, .{ .link = expected });
-        } else {
-            try self.unify(generated, expected);
-        }
+        // The caller reached this path only through a pattern whose named
+        // backing carries generated-private authority. Preserve that explicit
+        // producer-owned backing deterministically; structural size is not an
+        // authority signal.
+        self.program.types.set(expected, .{ .link = generated });
     }
 
     fn expectExpr(self: *Solver, expr_id: Lifted.ExprId, expected: Type.TypeVarId) Allocator.Error!Type.TypeVarId {
@@ -1058,13 +1047,6 @@ const Solver = struct {
             .named => |named| if (named.builtin_owner) |builtin_owner| builtin_owner == owner else false,
             else => false,
         };
-    }
-
-    fn generatedOpaqueEvidenceScore(self: *Solver, named: anytype) u8 {
-        if (!isGeneratedOpaqueEvidenceOwner(named.builtin_owner)) return 0;
-
-        const backing = named.backing orelse return 0;
-        return generatedBackingScore(self.program.types.rootContentCompressed(backing.ty)) orelse 2;
     }
 
     fn bindLowLevelTypes(
@@ -1351,26 +1333,22 @@ const Solver = struct {
                         Common.invariant("named type identity failed Lambda Solved unification");
                     }
                     try self.unifySpans(left_named.args, right_named.args, "named type arguments failed Lambda Solved unification");
-                    // Aliases have already been unwrapped above. Generated
-                    // opaque evidence uses its backing only to carry generated
-                    // compile-time evidence rows, so two values with the same nominal
-                    // identity may intentionally have different backing rows.
-                    if (isGeneratedOpaqueEvidenceOwner(left_named.builtin_owner) or
-                        isGeneratedOpaqueEvidenceOwner(right_named.builtin_owner))
-                    {
-                        if (self.generatedOpaqueEvidenceScore(right_named) > self.generatedOpaqueEvidenceScore(left_named)) {
+                    if (left_named.backing) |left_backing| {
+                        const right_backing = right_named.backing orelse Common.invariant("named type backing differed during Lambda Solved unification");
+                        if (left_backing.use != right_backing.use) Common.invariant("named type backing use differed during Lambda Solved unification");
+                        if (left_backing.authority == right_backing.authority) {
+                            try self.unify(left_backing.ty, right_backing.ty);
+                            self.program.types.set(b, .{ .link = a });
+                        } else if (left_backing.authority == .generated_private) {
+                            self.program.types.set(b, .{ .link = a });
+                        } else if (right_backing.authority == .generated_private) {
                             self.program.types.set(a, .{ .link = b });
                         } else {
-                            self.program.types.set(b, .{ .link = a });
+                            Common.invariant("named type backing authorities were incompatible during Lambda Solved unification");
                         }
+                    } else if (right_named.backing != null) {
+                        Common.invariant("named type backing differed during Lambda Solved unification");
                     } else {
-                        if (left_named.backing) |left_backing| {
-                            const right_backing = right_named.backing orelse Common.invariant("named type backing differed during Lambda Solved unification");
-                            if (left_backing.use != right_backing.use) Common.invariant("named type backing use differed during Lambda Solved unification");
-                            try self.unify(left_backing.ty, right_backing.ty);
-                        } else if (right_named.backing != null) {
-                            Common.invariant("named type backing differed during Lambda Solved unification");
-                        }
                         self.program.types.set(b, .{ .link = a });
                     }
                 },
@@ -1674,13 +1652,14 @@ const TypeCloner = struct {
                     .builtin_owner = named.builtin_owner,
                     .args = try self.solver.program.types.addSpan(args),
                     .backing = if (named.backing) |raw_backing| blk_backing: {
-                        const backing_ty = if (isGeneratedOpaqueEvidenceOwner(named.builtin_owner))
+                        const backing_ty = if (raw_backing.authority == .generated_private)
                             raw_backing.ty
                         else
                             try self.structuralBackingForNamed(named.def, raw_backing.ty);
                         break :blk_backing .{
                             .ty = try self.lower(backing_ty),
                             .use = raw_backing.use,
+                            .authority = raw_backing.authority,
                         };
                     } else null,
                     .declared_order = try self.lowerDeclaredOrder(named.declared_order),
@@ -1727,25 +1706,6 @@ const TypeCloner = struct {
         }
     }
 };
-
-fn generatedBackingScore(content: Type.Content) ?u8 {
-    return switch (content) {
-        .record => |fields| if (fields.count() == 0) 1 else 2,
-        .zst => 1,
-        else => null,
-    };
-}
-
-fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
-    const actual = owner orelse return false;
-    return switch (actual) {
-        .fields,
-        .field,
-        .parse_tag_union_spec,
-        => true,
-        else => false,
-    };
-}
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
     return left.module == right.module and

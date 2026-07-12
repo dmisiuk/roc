@@ -95,3 +95,36 @@ test "discharging a dispatch constraint onto a constrained method target records
     }
     try std.testing.expect(found_resolved_pair);
 }
+
+test "block-local attached procedures record their dispatch target edges" {
+    const source =
+        \\first = {
+        \\    Local := [First(U64)].{
+        \\        get : Local -> U64
+        \\        get = |Local.First(n)| n
+        \\    }
+        \\    Local.First(5).get()
+        \\}
+        \\
+        \\second = {
+        \\    Local := [Second(U64)].{
+        \\        get : Local -> U64
+        \\        get = |Local.Second(n)| n + 100
+        \\    }
+        \\    Local.Second(8).get()
+        \\}
+        \\
+        \\main = (first, second)
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+    try test_env.assertDefType("main", "(U64, U64)");
+
+    const env = test_env.module_env;
+    var zero_pair_targets: usize = 0;
+    for (env.scheme_instantiations.items.items) |record| {
+        if (record.slot_kind != @intFromEnum(Slot.dispatch_target)) continue;
+        if (record.pairs_len == 0) zero_pair_targets += 1;
+    }
+    try std.testing.expect(zero_pair_targets >= 2);
+}

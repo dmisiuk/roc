@@ -1088,6 +1088,7 @@ fn markReachableLiftedExpr(
     reachable[index] = true;
 
     switch (program.getExprAt(index).data) {
+        .@"unreachable",
         .local,
         .unit,
         .int_lit,
@@ -1626,6 +1627,9 @@ test "monotype specialization cache read reuses loaded hits and lowers fresh mis
         .shard_id = @enumFromInt(1),
         .types = loaded_types.view,
         .specs = &loaded_specs,
+        .fns = loaded_program_view.fns,
+        .const_fn_evidence = loaded_program_view.const_fn_evidence,
+        .const_fn_evidence_frames = loaded_program_view.const_fn_evidence_frames,
     }};
 
     var no_cache = try lowerMonotypeModuleWithOptions(allocator, mixed_source, .{

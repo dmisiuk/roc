@@ -197,15 +197,8 @@ MISSING METHOD - fuzz_crash_019.md:58:6:58:11
 TYPE MISMATCH - fuzz_crash_019.md:52:2:52:2
 DECLARATION HAS NO VALUE - fuzz_crash_019.md:74:1:74:22
 DECLARATION HAS NO VALUE - fuzz_crash_019.md:113:1:113:7
-TOO FEW ARGS - fuzz_crash_019.md:84:2:86:3
-MISSING METHOD - fuzz_crash_019.md:86:11:86:17
-TYPE MISMATCH - fuzz_crash_019.md:98:4:104:3
-TYPE MISMATCH - fuzz_crash_019.md:105:2:105:54
-TYPE MISMATCH - fuzz_crash_019.md:93:22:93:24
 DECLARATION HAS NO VALUE - fuzz_crash_019.md:116:1:116:13
 TYPE MISMATCH - fuzz_crash_019.md:119:2:119:10
-MISSING METHOD - fuzz_crash_019.md:105:55:105:66
-MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 # PROBLEMS
 
 ┌─────────────────────┐
@@ -1063,96 +1056,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
     they are published through the host boundary.
 
 
-┌──────────────┐
-│ TOO FEW ARGS ├─ The `me` function expects 2 arguments, but it got 1 ────────┐
-└┬─────────────┘  instead.                                                    │
- │                                                                            │
- │  me(                                                                       │
- │      ..., # r                                                              │
- │  )crash ke"Unr!" #)                                                        │
- │                                                                            │
- └──────────────────────────────────────────────────── fuzz_crash_019.md:84:2 ┘
-
-    The `me` function has the type:
-
-        [Blue, ..], [Tb] -> Error
-
-    Are there any missing commas?
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This `from_quote` method is being called on a value ──────┐
-└┬───────────────┘  whose type doesn't have that method.                      │
- │                                                                            │
- │  )crash ke"Unr!" #)                                                        │
- │           ‾‾‾‾‾‾                                                           │
- └─────────────────────────────────────────────────── fuzz_crash_019.md:86:11 ┘
-
-    The value's type, which does not have a method named `from_quote`, is:
-
-        {}
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ This expression produces a value, but it's not being ──────┐
-└┬──────────────┘  used.                                                      │
- │                                                                            │
- │  m (                                                                       │
- │      123,                                                                  │
- │      "World",ag1,                                                          │
- │      O, # nt                                                               │
- │      (ne, tuple),                                                          │
- │      [1, 2, 3],                                                            │
- │  )                                                                         │
- │                                                                            │
- └──────────────────────────────────────────────────── fuzz_crash_019.md:98:4 ┘
-
-    It has the type:
-
-        (f, j, Error, [O, ..], (Error, Error), List(l))
-          where [
-            f.from_numeral : Numeral -> Try(f, [InvalidNumeral(Str)]),
-            j.from_quote : Str -> Try(j, [BadQuotedBytes(Str)]),
-            l.from_numeral : Numeral -> Try(l, [InvalidNumeral(Str)]),
-          ]
-
-    Since this expression is used as a statement, it must evaluate to `{}`.
-    If you don't need the value, you can ignore it with `_ =`.
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ This expression produces a value, but it's not being ──────┐
-└┬──────────────┘  used.                                                      │
- │                                                                            │
- │  b?? 12 > 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 e_fn(arg1)?.od()?.n… │
- │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                      │
- └─────────────────────────────────────────────────── fuzz_crash_019.md:105:2 ┘
-
-    It has the type:
-
-        Bool
-
-    Since this expression is used as a statement, it must evaluate to `{}`.
-    If you don't need the value, you can ignore it with `_ =`.
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ This expression is used in an unexpected way. ─────────────┐
-└┬──────────────┘                                                             │
- │                                                                            │
- │  line!("Ag ${n} to ${er}")                                                 │
- │                      ‾‾                                                    │
- └─────────────────────────────────────────────────── fuzz_crash_019.md:93:22 ┘
-
-    It has the type:
-
-        Dec
-
-    But you are trying to use it as:
-
-        Str
-
-
 ┌──────────────────────────┐
 │ DECLARATION HAS NO VALUE ├─ This declaration has a type annotation but no ──┐
 └┬─────────────────────────┘  implementation.                                 │
@@ -1179,36 +1082,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 
     Since this expression is used as a statement, it must evaluate to `{}`.
     If you don't need the value, you can ignore it with `_ =`.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named `od` on an ─────┐
-└┬───────────────┘  unresolved type variable, but unresolved type variables   │
- │                  have no methods.                                          │
- │                                                                            │
- │  …12 <= 3 e_fn(arg1)?.od()?.ned()?.recd?                                   │
- │           ‾‾‾‾‾‾‾‾‾‾‾                                                      │
- └────────────────────────────────────────────────── fuzz_crash_019.md:105:55 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named `ned` on an ────┐
-└┬───────────────┘  unresolved type variable, but unresolved type variables   │
- │                  have no methods.                                          │
- │                                                                            │
- │  …12 <= 3 e_fn(arg1)?.od()?.ned()?.recd?                                   │
- │           ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                │
- └────────────────────────────────────────────────── fuzz_crash_019.md:105:55 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
 
 # TOKENS
 ~~~zig
@@ -1995,7 +1868,7 @@ expect {
 				(s-return
 					(e-runtime-error (tag "expr_not_canonicalized")))
 				(s-expr
-					(e-call (constraint-fn-var 1150)
+					(e-call
 						(e-lookup-local
 							(p-assign (ident "me")))
 						(e-not-implemented)))
@@ -2043,7 +1916,7 @@ expect {
 										(p-assign (ident "#interp_2"))
 										(e-lookup-local
 											(p-assign (ident "er"))))
-									(e-interpolation (constraint-fn-var 1246)
+									(e-interpolation
 										(first
 											(e-literal (string "Ag ")))
 										(parts
@@ -2053,12 +1926,10 @@ expect {
 											(e-lookup-local
 												(p-assign (ident "#interp_2")))
 											(e-literal (string "")))))))
-						(e-dispatch-call (method "plus") (constraint-fn-var 1249)
-							(receiver
-								(e-runtime-error (tag "ident_not_in_scope")))
-							(args
-								(e-lookup-local
-									(p-assign (ident "n")))))))
+						(e-binop (op "add")
+							(e-runtime-error (tag "ident_not_in_scope"))
+							(e-lookup-local
+								(p-assign (ident "n"))))))
 				(s-let
 					(p-assign (ident "rd"))
 					(e-record
@@ -2117,30 +1988,28 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 1377)
-									(receiver
-										(e-match
-											(match
-												(cond
-													(e-runtime-error (tag "ident_not_in_scope")))
-												(branches
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-lookup-local
-																(p-assign (ident "#ok")))))
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-num (value "12"))))))))
-									(args
-										(e-num (value "5"))))
+								(e-binop (op "gt")
+									(e-match
+										(match
+											(cond
+												(e-runtime-error (tag "ident_not_in_scope")))
+											(branches
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-lookup-local
+															(p-assign (ident "#ok")))))
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-num (value "12")))))))
+									(e-num (value "5")))
 								(e-nominal-external
 									(builtin)
 									(e-tag (name "True")))))
@@ -2151,24 +2020,16 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 1410)
-														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 1400)
-																(receiver
-																	(e-num (value "13")))
-																(args
-																	(e-num (value "2")))))
-														(args
-															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 1437)
-														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 1427)
-																(receiver
-																	(e-num (value "10")))
-																(args
-																	(e-num (value "1")))))
-														(args
-															(e-num (value "16"))))))
+													(e-binop (op "lt")
+														(e-binop (op "add")
+															(e-num (value "13"))
+															(e-num (value "2")))
+														(e-num (value "5")))
+													(e-binop (op "ge")
+														(e-binop (op "sub")
+															(e-num (value "10"))
+															(e-num (value "1")))
+														(e-num (value "16")))))
 											(if-else
 												(e-nominal-external
 													(builtin)
@@ -2177,11 +2038,9 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 1465)
-										(receiver
-											(e-num (value "12")))
-										(args
-											(e-num (value "3")))))))))
+									(e-binop (op "le")
+										(e-num (value "12"))
+										(e-num (value "3"))))))))
 				(s-expr
 					(e-match
 						(match
@@ -2191,12 +2050,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "ned") (constraint-fn-var 1526)
+													(e-method-call (method "ned")
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "od") (constraint-fn-var 1497)
+																		(e-method-call (method "od")
 																			(receiver
 																				(e-match
 																					(match
@@ -2211,7 +2070,8 @@ expect {
 																										(p-nominal-external (builtin)
 																											(p-applied-tag))))
 																								(value
-																									(e-runtime-error (tag "erroneous_value_expr"))))
+																									(e-lookup-local
+																										(p-assign (ident "#ok")))))
 																							(branch
 																								(patterns
 																									(pattern (degenerate false)
@@ -2233,7 +2093,8 @@ expect {
 																					(p-nominal-external (builtin)
 																						(p-applied-tag))))
 																			(value
-																				(e-runtime-error (tag "erroneous_value_expr"))))
+																				(e-lookup-local
+																					(p-assign (ident "#ok")))))
 																		(branch
 																			(patterns
 																				(pattern (degenerate false)

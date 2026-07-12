@@ -614,6 +614,7 @@ const Lowerer = struct {
                     .backing = if (named.backing) |backing| .{
                         .ty = try self.constTypeOfType(backing.ty),
                         .use = constBackingUse(backing.use),
+                        .authority = constBackingAuthority(backing.authority),
                     } else null,
                     .declared_order = try self.result.const_types.appendDeclaredFieldSpan(stored_declared),
                 } };
@@ -648,7 +649,7 @@ const Lowerer = struct {
             for (variants[0..initialized]) |variant| {
                 if (variant.captures.len > 0) self.allocator.free(variant.captures);
                 if (variant.template.evidence.len > 0) self.allocator.free(variant.template.evidence);
-                if (variant.template.evidence_frame_root_counts.len > 0) self.allocator.free(variant.template.evidence_frame_root_counts);
+                if (variant.template.evidence_frames.len > 0) self.allocator.free(variant.template.evidence_frames);
             }
             self.allocator.free(variants);
         }
@@ -697,7 +698,7 @@ const Lowerer = struct {
             for (entries[0..initialized]) |entry| {
                 if (entry.captures.len > 0) self.allocator.free(entry.captures);
                 if (entry.template.evidence.len > 0) self.allocator.free(entry.template.evidence);
-                if (entry.template.evidence_frame_root_counts.len > 0) self.allocator.free(entry.template.evidence_frame_root_counts);
+                if (entry.template.evidence_frames.len > 0) self.allocator.free(entry.template.evidence_frames);
             }
             self.allocator.free(entries);
         }
@@ -934,6 +935,7 @@ const Lowerer = struct {
                     .next = next,
                 } });
             },
+            .@"unreachable" => Common.invariant("unreachable marker escaped its terminated block-final position during LIR lowering"),
             .uninitialized, .uninitialized_payload => next,
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
@@ -1833,8 +1835,20 @@ const Lowerer = struct {
     }
 
     fn lowerBlockInto(self: *Lowerer, target: LIR.LocalId, stmts_span: LambdaMono.Span(LambdaMono.StmtId), final_expr: LambdaMono.ExprId, next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-        var current = try self.lowerExprInto(target, final_expr, next);
         const stmts = self.program.stmtSpan(stmts_span);
+        var current = switch (self.expr(final_expr).data) {
+            .@"unreachable" => blk: {
+                if (stmts.len == 0) {
+                    Common.invariant("unreachable block-final marker had no preceding terminating statement");
+                }
+                // Monotype emits this marker only after its checked, explicit
+                // statement-termination relation has stopped the block. Its
+                // block-final position is the capability to erase it; the
+                // generic expression path rejects the marker.
+                break :blk next;
+            },
+            else => try self.lowerExprInto(target, final_expr, next),
+        };
         var i = stmts.len;
         while (i > 0) {
             i -= 1;
@@ -3399,6 +3413,7 @@ const Lowerer = struct {
 
     fn joinArgNeedsWrite(self: *Lowerer, param: LIR.LocalId, expr_id: LambdaMono.ExprId) Common.LowerError!bool {
         return switch (self.expr(expr_id).data) {
+            .@"unreachable" => Common.invariant("unreachable marker escaped its terminated block-final position into a join argument"),
             .uninitialized, .uninitialized_payload => false,
             .local => |local| (try self.localFor(local)) != param,
             else => true,
@@ -4005,17 +4020,37 @@ fn constBackingUse(use: MonoType.BackingUse) const_store.TypeBackingUse {
     };
 }
 
+fn constBackingAuthority(authority: MonoType.BackingAuthority) const_store.TypeBackingAuthority {
+    return switch (authority) {
+        .checked_public => .checked_public,
+        .generated_private => .generated_private,
+    };
+}
+
 fn constFnTemplateFromMono(self: *Lowerer, template: Mono.FnTemplate) Allocator.Error!LirProgram.FnTemplate {
+    requireConstFnEvidenceTopology(template);
     const evidence = try self.allocator.dupe(check.ConstStore.ConstFnEvidence, self.program.constFnEvidence(template.const_evidence));
     errdefer self.allocator.free(evidence);
-    const frame_root_counts = try self.allocator.dupe(u32, self.program.constFnEvidenceFrameRootCounts(template.const_evidence_frame_root_counts));
+    const evidence_frames = try self.allocator.dupe(check.ConstStore.ConstFnEvidenceFrame, self.program.constFnEvidenceFrames(template.const_evidence_frames));
     return .{
         .fn_def = constFnDefFromMono(template.fn_def),
         .source_fn_ty = template.source_fn_ty,
         .source_fn_key = template.source_fn_key,
         .evidence = evidence,
-        .evidence_frame_root_counts = frame_root_counts,
+        .evidence_frames = evidence_frames,
+        .evidence_frame_head = template.const_evidence_frame_head,
     };
+}
+
+fn requireConstFnEvidenceTopology(template: Mono.FnTemplate) void {
+    if (template.const_evidence_frames.len != 0 and template.const_evidence_frame_head != null) return;
+    switch (template.fn_def) {
+        .parser_runtime, .encoder_for_runtime => {},
+        .nested => Common.invariant("nested callable reached LIR without explicit evidence topology"),
+        .local_template, .imported_template => Common.invariant("template callable reached LIR without explicit evidence topology"),
+        .local_hosted, .imported_hosted => Common.invariant("hosted callable reached LIR without explicit evidence topology"),
+        .checked_generated => Common.invariant("checked-generated callable reached LIR without explicit evidence topology"),
+    }
 }
 
 fn constFnDefFromMono(fn_def: Mono.FnDef) check.ConstStore.FnDef {

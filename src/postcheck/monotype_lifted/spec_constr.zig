@@ -500,6 +500,7 @@ const Pass = struct {
     fn markArgUsesInExpr(self: *Pass, fn_id: Ast.FnId, expr_id: Ast.ExprId, changed: *bool) Allocator.Error!void {
         const expr = self.program.getExpr(expr_id);
         switch (expr.data) {
+            .@"unreachable",
             .local,
             .unit,
             .int_lit,
@@ -669,6 +670,7 @@ const Pass = struct {
     fn collectCallPatternsInExpr(self: *Pass, owner: Ast.FnId, expr_id: Ast.ExprId) Allocator.Error!void {
         const expr = self.program.getExpr(expr_id);
         switch (expr.data) {
+            .@"unreachable",
             .local,
             .unit,
             .int_lit,
@@ -949,6 +951,7 @@ const Pass = struct {
 
         const expr = self.program.getExprAt(index);
         switch (expr.data) {
+            .@"unreachable",
             .local,
             .unit,
             .int_lit,
@@ -1765,6 +1768,7 @@ const Cloner = struct {
 
         const expr = self.pass.program.getExpr(expr_id);
         const data: Ast.ExprData = switch (expr.data) {
+            .@"unreachable" => .@"unreachable",
             .local => |local| .{ .local = local },
             .unit => .unit,
             .uninitialized => .uninitialized,
@@ -3479,6 +3483,7 @@ fn localExpr(program: *const Ast.Program, expr_id: Ast.ExprId) ?Ast.LocalId {
 
 fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
     return switch (program.getExpr(expr_id).data) {
+        .@"unreachable",
         .local,
         .unit,
         .int_lit,
@@ -3597,6 +3602,7 @@ fn stmtContainsReturn(program: *const Ast.Program, stmt_id: Ast.StmtId) bool {
 
 fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: Ast.ExprId) usize {
     return switch (program.getExpr(expr_id).data) {
+        .@"unreachable" => 0,
         .local => |seen| if (seen == local) 1 else 0,
         .unit,
         .int_lit,
@@ -3736,6 +3742,7 @@ fn localUseBeforeEffect(program: *const Ast.Program, local: Ast.LocalId, expr_id
 fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: Ast.ExprId, scan: *LocalUseScan) void {
     const expr = program.getExpr(expr_id);
     switch (expr.data) {
+        .@"unreachable" => {},
         .local => |seen| {
             if (seen == local) {
                 if (scan.seen_effect) {

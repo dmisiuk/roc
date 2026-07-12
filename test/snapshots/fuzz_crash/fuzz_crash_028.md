@@ -261,13 +261,8 @@ MISSING METHOD - fuzz_crash_028.md:68:3:68:8
 MISSING METHOD - fuzz_crash_028.md:70:3:70:8
 TYPE MISMATCH - fuzz_crash_028.md:64:2:64:2
 DECLARATION HAS NO VALUE - fuzz_crash_028.md:95:1:95:34
-TOO FEW ARGS - fuzz_crash_028.md:104:2:106:3
-TYPE MISMATCH - fuzz_crash_028.md:115:3:115:3
-TYPE MISMATCH - fuzz_crash_028.md:133:5:133:12
 DECLARATION HAS NO VALUE - fuzz_crash_028.md:141:1:141:7
 DECLARATION HAS NO VALUE - fuzz_crash_028.md:144:1:144:13
-MISSING METHOD - fuzz_crash_028.md:133:5:133:12
-MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 # PROBLEMS
 
 ASCII CONTROL CHARACTER
@@ -1820,62 +1815,6 @@ Numbers cannot have leading zeros.
     they are published through the host boundary.
 
 
-┌──────────────┐
-│ TOO FEW ARGS ├─ The `match_time` function expects 2 arguments, but it got ──┐
-└┬─────────────┘  1 instead.                                                  │
- │                                                                            │
- │  match_time(                                                               │
- │      ...                                                                   │
- │  )                                                                         │
- │                                                                            │
- └─────────────────────────────────────────────────── fuzz_crash_028.md:104:2 ┘
-
-    The `match_time` function has the type:
-
-        [Blue, Red, ..], _arg -> Error
-
-    Are there any missing commas?
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ The first argument being passed to this function has the ──┐
-└┬──────────────┘  wrong type.                                                │
- │                                                                            │
- │          add_one(dbg # Afist                                               │
- │  er, # afarg                                                               │
- │          ), 456, # ee                                                      │
- │                                                                            │
- └────────────────────────────────────────────────── fuzz_crash_028.md:115:11 ┘
-
-    This argument has the type:
-
-        {}
-
-    But `add_one` needs the first argument to be:
-
-        U64
-
-
-┌───────────────┐
-│ TYPE MISMATCH ├─ This `?` may return early with a type that doesn't match ──┐
-└┬──────────────┘  the function body.                                         │
- │                                                                            │
- │  le =(arg1)?.od()?.ned()?.recd?                                            │
- │      ‾‾‾‾‾‾‾                                                               │
- └─────────────────────────────────────────────────── fuzz_crash_028.md:133:5 ┘
-
-    On error, this would return:
-
-        Try(ok, err)
-
-    But the function body evaluates to:
-
-        [Blue, ..]
-
-    Hint: The error types from all `?` operators and the function body must be
-    compatible since any of them could be the actual return value.
-
-
 ┌──────────────────────────┐
 │ DECLARATION HAS NO VALUE ├─ This declaration has a type annotation but no ──┐
 └┬─────────────────────────┘  implementation.                                 │
@@ -1898,36 +1837,6 @@ Numbers cannot have leading zeros.
 
     Add a value body here, or put hosted functions in a platform type module so
     they are published through the host boundary.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named `od` on an ─────┐
-└┬───────────────┘  unresolved type variable, but unresolved type variables   │
- │                  have no methods.                                          │
- │                                                                            │
- │  le =(arg1)?.od()?.ned()?.recd?                                            │
- │      ‾‾‾‾‾‾‾                                                               │
- └─────────────────────────────────────────────────── fuzz_crash_028.md:133:5 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
-
-
-┌────────────────┐
-│ MISSING METHOD ├─ This is trying to dispatch a method named `ned` on an ────┐
-└┬───────────────┘  unresolved type variable, but unresolved type variables   │
- │                  have no methods.                                          │
- │                                                                            │
- │  le =(arg1)?.od()?.ned()?.recd?                                            │
- │      ‾‾‾‾‾‾‾‾‾‾‾‾‾                                                         │
- └─────────────────────────────────────────────────── fuzz_crash_028.md:133:5 ┘
-
-    Hint: You can replace this static dispatch call with an ordinary function
-    call, or force the type variable to become more concrete—for example, by
-    adding a type annotation that narrows its type to something that actually
-    has methods.
 
 # TOKENS
 ~~~zig
@@ -2934,7 +2843,7 @@ expect {
 				(s-expr
 					(e-runtime-error (tag "expr_not_canonicalized")))
 				(s-expr
-					(e-call (constraint-fn-var 1558)
+					(e-call
 						(e-lookup-local
 							(p-assign (ident "match_time")))
 						(e-not-implemented)))
@@ -2957,7 +2866,7 @@ expect {
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "world"))))
-						(e-interpolation (constraint-fn-var 1585)
+						(e-interpolation
 							(first
 								(e-literal (string "H, ")))
 							(parts
@@ -2978,31 +2887,29 @@ expect {
 					(p-assign (ident "n"))
 					(e-runtime-error (tag "ident_not_in_scope"))
 					(e-block
-						(e-dispatch-call (method "plus") (constraint-fn-var 1647)
-							(receiver
-								(e-call
-									(e-runtime-error (tag "ident_not_in_scope"))
-									(e-block
-										(s-let
-											(p-assign (ident "#interp_1"))
+						(e-binop (op "add")
+							(e-call
+								(e-runtime-error (tag "ident_not_in_scope"))
+								(e-block
+									(s-let
+										(p-assign (ident "#interp_1"))
+										(e-lookup-local
+											(p-assign (ident "n"))))
+									(s-let
+										(p-assign (ident "#interp_2"))
+										(e-runtime-error (tag "ident_not_in_scope")))
+									(e-interpolation
+										(first
+											(e-literal (string "Ag ")))
+										(parts
 											(e-lookup-local
-												(p-assign (ident "n"))))
-										(s-let
-											(p-assign (ident "#interp_2"))
-											(e-runtime-error (tag "ident_not_in_scope")))
-										(e-interpolation
-											(first
-												(e-literal (string "Ag ")))
-											(parts
-												(e-lookup-local
-													(p-assign (ident "#interp_1")))
-												(e-literal (string " to "))
-												(e-lookup-local
-													(p-assign (ident "#interp_2")))
-												(e-literal (string "")))))))
-							(args
-								(e-lookup-local
-									(p-assign (ident "n")))))))
+												(p-assign (ident "#interp_1")))
+											(e-literal (string " to "))
+											(e-lookup-local
+												(p-assign (ident "#interp_2")))
+											(e-literal (string ""))))))
+							(e-lookup-local
+								(p-assign (ident "n"))))))
 				(s-let
 					(p-assign (ident "rd"))
 					(e-record
@@ -3072,36 +2979,32 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 1790)
-									(receiver
-										(e-match
-											(match
-												(cond
-													(e-tag (name "Err")
-														(args
-															(e-runtime-error (tag "ident_not_in_scope")))))
-												(branches
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-lookup-local
-																(p-assign (ident "#ok")))))
-													(branch
-														(patterns
-															(pattern (degenerate false)
-																(p-nominal-external (builtin)
-																	(p-applied-tag))))
-														(value
-															(e-num (value "12"))))))))
-									(args
-										(e-dispatch-call (method "times") (constraint-fn-var 1787)
-											(receiver
-												(e-num (value "5")))
-											(args
-												(e-num (value "5"))))))
+								(e-binop (op "gt")
+									(e-match
+										(match
+											(cond
+												(e-tag (name "Err")
+													(args
+														(e-runtime-error (tag "ident_not_in_scope")))))
+											(branches
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-lookup-local
+															(p-assign (ident "#ok")))))
+												(branch
+													(patterns
+														(pattern (degenerate false)
+															(p-nominal-external (builtin)
+																(p-applied-tag))))
+													(value
+														(e-num (value "12")))))))
+									(e-binop (op "mul")
+										(e-num (value "5"))
+										(e-num (value "5"))))
 								(e-nominal-external
 									(builtin)
 									(e-tag (name "True")))))
@@ -3112,24 +3015,16 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 1823)
-														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 1813)
-																(receiver
-																	(e-num (value "13")))
-																(args
-																	(e-num (value "2")))))
-														(args
-															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 1850)
-														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 1840)
-																(receiver
-																	(e-num (value "10")))
-																(args
-																	(e-num (value "1")))))
-														(args
-															(e-num (value "16"))))))
+													(e-binop (op "lt")
+														(e-binop (op "add")
+															(e-num (value "13"))
+															(e-num (value "2")))
+														(e-num (value "5")))
+													(e-binop (op "ge")
+														(e-binop (op "sub")
+															(e-num (value "10"))
+															(e-num (value "1")))
+														(e-num (value "16")))))
 											(if-else
 												(e-nominal-external
 													(builtin)
@@ -3138,15 +3033,11 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 1887)
-										(receiver
-											(e-num (value "12")))
-										(args
-											(e-dispatch-call (method "div_by") (constraint-fn-var 1884)
-												(receiver
-													(e-num (value "3")))
-												(args
-													(e-num (value "5")))))))))))
+									(e-binop (op "le")
+										(e-num (value "12"))
+										(e-binop (op "div")
+											(e-num (value "3"))
+											(e-num (value "5")))))))))
 				(s-let
 					(p-assign (ident "le"))
 					(e-match
@@ -3157,12 +3048,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "ned") (constraint-fn-var 1945)
+													(e-method-call (method "ned")
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "od") (constraint-fn-var 1916)
+																		(e-method-call (method "od")
 																			(receiver
 																				(e-match
 																					(match
@@ -3175,7 +3066,8 @@ expect {
 																										(p-nominal-external (builtin)
 																											(p-applied-tag))))
 																								(value
-																									(e-runtime-error (tag "erroneous_value_expr"))))
+																									(e-lookup-local
+																										(p-assign (ident "#ok")))))
 																							(branch
 																								(patterns
 																									(pattern (degenerate false)
@@ -3197,7 +3089,8 @@ expect {
 																					(p-nominal-external (builtin)
 																						(p-applied-tag))))
 																			(value
-																				(e-runtime-error (tag "erroneous_value_expr"))))
+																				(e-lookup-local
+																					(p-assign (ident "#ok")))))
 																		(branch
 																			(patterns
 																				(pattern (degenerate false)
@@ -3345,11 +3238,11 @@ expect {
 	(defs
 		(patt (type "(Error, Error)"))
 		(patt (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
-		(patt (type "Error -> U64"))
+		(patt (type "U64 -> U64"))
 		(patt (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
 		(patt (type "[Blue, Red, ..], _arg -> Error"))
 		(patt (type "Error -> Error"))
-		(patt (type "_arg -> Error"))
+		(patt (type "_arg -> [Blue, ..]"))
 		(patt (type "{}"))
 		(patt (type "{}"))
 		(patt (type "Error")))
@@ -3373,11 +3266,11 @@ expect {
 	(expressions
 		(expr (type "(Error, Error)"))
 		(expr (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
-		(expr (type "Error -> U64"))
+		(expr (type "U64 -> U64"))
 		(expr (type "Bool -> d where [d.from_numeral : Numeral -> Try(d, [InvalidNumeral(Str)])]"))
 		(expr (type "[Blue, Red, ..], _arg -> Error"))
 		(expr (type "Error -> Error"))
-		(expr (type "_arg -> Error"))
+		(expr (type "_arg -> [Blue, ..]"))
 		(expr (type "{}"))
 		(expr (type "{}"))
 		(expr (type "Error"))))

@@ -14,6 +14,7 @@ const Type = @import("type.zig");
 
 const checked = check.CheckedModule;
 const names = check.CheckedNames;
+const static_dispatch = check.StaticDispatchRegistry;
 const GuardedList = collections.GuardedList;
 
 /// Guarded growable list for mutable Monotype program storage.
@@ -114,16 +115,25 @@ pub const NestedFn = struct {
     context_fn_key: names.TypeDigest,
 };
 
+/// Stable identity of the explicit dispatch evidence captured by one
+/// specialization. Equal callable/type requests with different evidence must
+/// remain distinct specializations.
+pub const EvidenceDigest = extern struct {
+    bytes: [32]u8 = [_]u8{0} ** 32,
+};
+
 /// Function template plus source and monomorphic type identities.
 pub const FnTemplate = struct {
     fn_def: FnDef,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: Type.TypeId,
+    evidence_digest: EvidenceDigest = .{},
     /// Explicit dispatch selections captured when this specialization was
     /// created, retained for compile-time function values.
     const_evidence: Span(check.ConstStore.ConstFnEvidence) = Span(check.ConstStore.ConstFnEvidence).empty(),
-    const_evidence_frame_root_counts: Span(u32) = Span(u32).empty(),
+    const_evidence_frames: Span(check.ConstStore.ConstFnEvidenceFrame) = Span(check.ConstStore.ConstFnEvidenceFrame).empty(),
+    const_evidence_frame_head: ?u32 = null,
 };
 
 /// Monotype function-specialization metadata.
@@ -176,6 +186,7 @@ pub const CallableIdentity = union(enum(u8)) {
 pub const SpecIdentity = struct {
     callable: CallableIdentity,
     source_fn_ty_digest: names.TypeDigest,
+    evidence_digest: EvidenceDigest,
     request_fn_ty_digest: names.TypeDigest,
     request_fn_ty: Type.TypeId,
 };
@@ -209,6 +220,7 @@ pub const SpecRecord = struct {
 pub fn fnTemplateIdentityEql(lhs: FnTemplate, rhs: FnTemplate) bool {
     return std.meta.eql(lhs.fn_def, rhs.fn_def) and
         std.mem.eql(u8, lhs.source_fn_key.bytes[0..], rhs.source_fn_key.bytes[0..]) and
+        std.mem.eql(u8, lhs.evidence_digest.bytes[0..], rhs.evidence_digest.bytes[0..]) and
         lhs.mono_fn_ty == rhs.mono_fn_ty;
 }
 
@@ -217,9 +229,89 @@ pub fn fnTemplateDigest(template: FnTemplate, types: *const Type.Store, name_sto
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     writeFnDef(&hasher, template.fn_def);
     writeBytes(&hasher, &template.source_fn_key.bytes);
+    writeBytes(&hasher, &template.evidence_digest.bytes);
     const mono_digest = types.specializationDigest(name_store, template.mono_fn_ty);
     writeBytes(&hasher, &mono_digest.bytes);
     return .{ .bytes = hasher.finalResult() };
+}
+
+/// Compute the stable digest used in specialization identity from the exact
+/// durable evidence nodes and lexical frames carried by a function template.
+pub fn fnEvidenceDigest(
+    evidence: []const check.ConstStore.ConstFnEvidence,
+    frames: []const check.ConstStore.ConstFnEvidenceFrame,
+    head: ?u32,
+) EvidenceDigest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    writeBytes(&hasher, "roc.monotype.fn_evidence.v1");
+    writeU32(&hasher, @intCast(evidence.len));
+    for (evidence) |entry| {
+        writeU8(&hasher, @intFromEnum(entry));
+        switch (entry) {
+            .target => |target| {
+                writeBytes(&hasher, &target.view.bytes);
+                writeMethodTarget(&hasher, target.method);
+                if (target.instantiation) |instantiation| {
+                    writeU8(&hasher, 1);
+                    writeBytes(&hasher, &instantiation.view.bytes);
+                    writeU32(&hasher, @intFromEnum(instantiation.callable_ty));
+                } else writeU8(&hasher, 0);
+                writeU8(&hasher, @intFromEnum(target.nested));
+                switch (target.nested) {
+                    .resolved => |nested| {
+                        writeU32(&hasher, nested.count);
+                        writeU32(&hasher, nested.subtree_len);
+                    },
+                    .from_callable => {},
+                }
+            },
+            .structural => |kind| writeU8(&hasher, @intFromEnum(kind)),
+            .unreachable_value, .checked_error => {},
+        }
+    }
+    writeU32(&hasher, @intCast(frames.len));
+    for (frames) |frame| {
+        writeU8(&hasher, @intFromEnum(frame.scope_id));
+        switch (frame.scope_id) {
+            .root => {},
+            .generalized => |scope| writeU32(&hasher, scope),
+        }
+        writeOptionalU32(&hasher, frame.parent);
+        writeU32(&hasher, frame.roots_start);
+        writeU32(&hasher, frame.roots_len);
+    }
+    writeOptionalU32(&hasher, head);
+    return .{ .bytes = hasher.finalResult() };
+}
+
+fn writeMethodTarget(hasher: *std.crypto.hash.sha2.Sha256, target: static_dispatch.MethodTarget) void {
+    writeU32(hasher, target.module_idx);
+    writeU32(hasher, @intFromEnum(target.def_idx));
+    writeU8(hasher, @intFromEnum(target.kind));
+    switch (target.kind) {
+        .procedure => |procedure| {
+            const proc_module = names.procedureValueModuleDigest(procedure.proc);
+            writeBytes(hasher, &proc_module.bytes);
+            writeU32(hasher, @intFromEnum(procedure.proc.proc_base));
+            const template_module = names.procTemplateModuleDigest(procedure.template);
+            writeBytes(hasher, &template_module.bytes);
+            writeU32(hasher, @intFromEnum(procedure.template.proc_base));
+            writeU32(hasher, @intFromEnum(procedure.template.template));
+        },
+        .local_proc => |local| {
+            writeU32(hasher, @intFromEnum(local.binder));
+            writeU32(hasher, @intFromEnum(local.expr));
+        },
+        .generated_structural_parser, .generated_structural_encoder => {},
+    }
+    writeU32(hasher, @intFromEnum(target.callable_ty));
+}
+
+fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
+    if (value) |actual| {
+        writeU8(hasher, 1);
+        writeU32(hasher, actual);
+    } else writeU8(hasher, 0);
 }
 
 fn writeFnDef(hasher: *std.crypto.hash.sha2.Sha256, fn_def: FnDef) void {
@@ -279,6 +371,10 @@ fn writeProcTemplate(hasher: *std.crypto.hash.sha2.Sha256, template: names.ProcT
 fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     writeU32(hasher, @intCast(bytes.len));
     hasher.update(bytes);
+}
+
+fn writeU8(hasher: *std.crypto.hash.sha2.Sha256, value: u8) void {
+    hasher.update(&.{value});
 }
 
 fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
@@ -517,6 +613,10 @@ pub const Return = struct {
 pub const ExprData = union(enum(u8)) {
     local: LocalId,
     unit,
+    /// No value is produced because an earlier statement in the containing
+    /// block terminates control flow. LIR lowering erases this marker after
+    /// verifying the block's preceding statement chain.
+    @"unreachable",
     int_lit: can.CIR.IntValue,
     frac_f32_lit: f32,
     frac_f64_lit: f64,
@@ -837,7 +937,7 @@ pub const ProgramView = struct {
     imported_fns: []const ImportedFn,
     fns: []const Fn,
     const_fn_evidence: []const check.ConstStore.ConstFnEvidence,
-    const_fn_evidence_frame_root_counts: []const u32,
+    const_fn_evidence_frames: []const check.ConstStore.ConstFnEvidenceFrame,
     defs: []const Def,
     nested_defs: []const NestedDef,
     exprs: []const Expr,
@@ -879,8 +979,8 @@ pub const ProgramView = struct {
         return self.const_fn_evidence[span.start..][0..span.len];
     }
 
-    pub fn constFnEvidenceFrameRootCounts(self: ProgramView, span: Span(u32)) []const u32 {
-        return self.const_fn_evidence_frame_root_counts[span.start..][0..span.len];
+    pub fn constFnEvidenceFrames(self: ProgramView, span: Span(check.ConstStore.ConstFnEvidenceFrame)) []const check.ConstStore.ConstFnEvidenceFrame {
+        return self.const_fn_evidence_frames[span.start..][0..span.len];
     }
 
     pub fn procDebugName(self: ProgramView, symbol: Common.Symbol) ?names.ExportNameId {
@@ -1007,7 +1107,7 @@ pub const ProgramBuilder = struct {
     imported_fns: ProgramList(ImportedFn, "imported_fns"),
     fns: ProgramList(Fn, "fns"),
     const_fn_evidence: ProgramList(check.ConstStore.ConstFnEvidence, "const_fn_evidence"),
-    const_fn_evidence_frame_root_counts: ProgramList(u32, "const_fn_evidence_frame_root_counts"),
+    const_fn_evidence_frames: ProgramList(check.ConstStore.ConstFnEvidenceFrame, "const_fn_evidence_frames"),
     defs: ProgramList(Def, "defs"),
     nested_defs: ProgramList(NestedDef, "nested_defs"),
     exprs: ProgramList(Expr, "exprs"),
@@ -1064,7 +1164,7 @@ pub const ProgramBuilder = struct {
             .imported_fns = .empty,
             .fns = .empty,
             .const_fn_evidence = .empty,
-            .const_fn_evidence_frame_root_counts = .empty,
+            .const_fn_evidence_frames = .empty,
             .defs = .empty,
             .nested_defs = .empty,
             .exprs = .empty,
@@ -1139,7 +1239,7 @@ pub const ProgramBuilder = struct {
         self.defs.deinit(self.allocator);
         self.fns.deinit(self.allocator);
         self.const_fn_evidence.deinit(self.allocator);
-        self.const_fn_evidence_frame_root_counts.deinit(self.allocator);
+        self.const_fn_evidence_frames.deinit(self.allocator);
         self.imported_fns.deinit(self.allocator);
         self.specs.deinit(self.allocator);
         self.types.deinit();
@@ -1158,9 +1258,9 @@ pub const ProgramBuilder = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn addConstFnEvidenceFrameRootCounts(self: *ProgramBuilder, values: []const u32) std.mem.Allocator.Error!Span(u32) {
-        const start: u32 = @intCast(self.const_fn_evidence_frame_root_counts.len());
-        try self.const_fn_evidence_frame_root_counts.appendSlice(self.allocator, values);
+    pub fn addConstFnEvidenceFrames(self: *ProgramBuilder, values: []const check.ConstStore.ConstFnEvidenceFrame) std.mem.Allocator.Error!Span(check.ConstStore.ConstFnEvidenceFrame) {
+        const start: u32 = @intCast(self.const_fn_evidence_frames.len());
+        try self.const_fn_evidence_frames.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
@@ -1168,8 +1268,8 @@ pub const ProgramBuilder = struct {
         return self.const_fn_evidence.unsafeRawItemsForView()[span.start..][0..span.len];
     }
 
-    pub fn constFnEvidenceFrameRootCounts(self: *const ProgramBuilder, span: Span(u32)) []const u32 {
-        return self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView()[span.start..][0..span.len];
+    pub fn constFnEvidenceFrames(self: *const ProgramBuilder, span: Span(check.ConstStore.ConstFnEvidenceFrame)) []const check.ConstStore.ConstFnEvidenceFrame {
+        return self.const_fn_evidence_frames.unsafeRawItemsForView()[span.start..][0..span.len];
     }
 
     pub fn fnCount(self: *const ProgramBuilder) usize {
@@ -1284,7 +1384,7 @@ pub const ProgramBuilder = struct {
             .imported_fns = self.imported_fns.unsafeRawItemsForView(),
             .fns = self.fns.unsafeRawItemsForView(),
             .const_fn_evidence = self.const_fn_evidence.unsafeRawItemsForView(),
-            .const_fn_evidence_frame_root_counts = self.const_fn_evidence_frame_root_counts.unsafeRawItemsForView(),
+            .const_fn_evidence_frames = self.const_fn_evidence_frames.unsafeRawItemsForView(),
             .defs = self.defs.unsafeRawItemsForView(),
             .nested_defs = self.nested_defs.unsafeRawItemsForView(),
             .exprs = self.exprs.unsafeRawItemsForView(),
@@ -1797,6 +1897,7 @@ test "monotype program view exposes read-only side arrays" {
         .identity = .{
             .callable = .{ .proc_template = .{ .module = .{}, .proc_base = 0, .template = 0 } },
             .source_fn_ty_digest = .{},
+            .evidence_digest = fnEvidenceDigest(&.{}, &.{}, null),
             .request_fn_ty_digest = .{},
             .request_fn_ty = unit_ty,
         },

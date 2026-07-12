@@ -26,7 +26,7 @@ pub fn run(
     owned.types = @import("../monotype/type.zig").Store.init(allocator);
     var imported_fns = owned.imported_fns.takeArrayList();
     var const_fn_evidence = owned.const_fn_evidence.takeArrayList();
-    var const_fn_evidence_frame_root_counts = owned.const_fn_evidence_frame_root_counts.takeArrayList();
+    var const_fn_evidence_frames = owned.const_fn_evidence_frames.takeArrayList();
     var exprs = owned.exprs.takeArrayList();
     var pats = owned.pats.takeArrayList();
     var stmts = owned.stmts.takeArrayList();
@@ -59,7 +59,7 @@ pub fn run(
         types,
         imported_fns,
         const_fn_evidence,
-        const_fn_evidence_frame_root_counts,
+        const_fn_evidence_frames,
         exprs,
         pats,
         stmts,
@@ -89,7 +89,7 @@ pub fn run(
     types = undefined;
     imported_fns = undefined;
     const_fn_evidence = undefined;
-    const_fn_evidence_frame_root_counts = undefined;
+    const_fn_evidence_frames = undefined;
     exprs = undefined;
     pats = undefined;
     stmts = undefined;
@@ -143,7 +143,7 @@ fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.Pr
         .imported_fns = source_view.imported_fns,
         .fns = source_view.fns,
         .const_fn_evidence = moved_view.const_fn_evidence,
-        .const_fn_evidence_frame_root_counts = moved_view.const_fn_evidence_frame_root_counts,
+        .const_fn_evidence_frames = moved_view.const_fn_evidence_frames,
         .defs = source_view.defs,
         .nested_defs = source_view.nested_defs,
         .exprs = moved_view.exprs,
@@ -554,6 +554,7 @@ const Lifter = struct {
 
         const expr = self.output.getExpr(expr_id);
         switch (expr.data) {
+            .@"unreachable",
             .local,
             .unit,
             .int_lit,
@@ -1235,6 +1236,7 @@ const CaptureSet = struct {
         const expr = input.getExpr(expr_id);
         switch (expr.data) {
             .local => |local| try self.addIfFree(local, bound),
+            .@"unreachable",
             .unit,
             .int_lit,
             .frac_f32_lit,
@@ -1600,7 +1602,7 @@ test "checkCaptureInvariants accepts a well-formed capture and catches a corrupt
         MonoType.Store.init(allocator),
         .empty, // imported_fns
         .empty, // const_fn_evidence
-        .empty, // const_fn_evidence_frame_root_counts
+        .empty, // const_fn_evidence_frames
         .empty, // exprs
         .empty, // pats
         .empty, // stmts
